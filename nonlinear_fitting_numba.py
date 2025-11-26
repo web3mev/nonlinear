@@ -73,7 +73,7 @@ def load_model_spec(csv_path='parameters.csv', df=None):
 
 # --- 2. Data Generation ---
 def generate_data(components, n_samples=int(1e6), seed=42):
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     data = {}
     
     generated_vars = set()
@@ -88,9 +88,9 @@ def generate_data(components, n_samples=int(1e6), seed=42):
                     if knots_key in comp:
                         k_min, k_max = comp[knots_key].min(), comp[knots_key].max()
                         margin = (k_max - k_min) * 0.1 if k_max > k_min else 1.0
-                        data[var_name] = np.random.uniform(k_min - margin, k_max + margin, n_samples)
+                        data[var_name] = rng.uniform(k_min - margin, k_max + margin, n_samples)
                     else:
-                        data[var_name] = np.random.normal(0, 1, n_samples)
+                        data[var_name] = rng.normal(0, 1, n_samples)
                 generated_vars.add(var_name)
 
     # Calculate y_true
@@ -114,7 +114,7 @@ def generate_data(components, n_samples=int(1e6), seed=42):
             if comp['fixed']:
                 val = comp['initial_value']
             else:
-                val = np.random.uniform(-0.5, 0.5)
+                val = rng.uniform(-0.5, 0.5)
             y_log += val * data[comp['x1_var']]
             true_values.append(np.array([val]))
             
@@ -125,13 +125,13 @@ def generate_data(components, n_samples=int(1e6), seed=42):
                 # Generate random curve
                 n_k = len(comp['knots'])
                 if comp['monotonicity'] in ['1', '1.0', 1]:
-                    vals = np.cumsum(np.random.uniform(0, 0.2, n_k))
+                    vals = np.cumsum(rng.uniform(0, 0.2, n_k))
                     vals -= vals.mean() # Center
                 elif comp['monotonicity'] in ['-1', '-1.0', -1]:
-                    vals = np.cumsum(np.random.uniform(0, 0.2, n_k)) * -1
+                    vals = np.cumsum(rng.uniform(0, 0.2, n_k)) * -1
                     vals -= vals.mean()
                 else:
-                    vals = np.random.uniform(-1, 1, n_k)
+                    vals = rng.uniform(-1, 1, n_k)
             
             y_log += lin_spl(data[comp['x1_var']], comp['knots'], vals)
             true_values.append(vals)
@@ -141,30 +141,49 @@ def generate_data(components, n_samples=int(1e6), seed=42):
                 vals = comp['initial_values']
             else:
                 # Random surface
-                vals = np.random.uniform(-0.5, 0.5, (comp['n_rows'], comp['n_cols']))
+                vals = rng.uniform(-0.5, 0.5, (comp['n_rows'], comp['n_cols']))
                 mono = comp['monotonicity']
                 if mono in ['1/-1', '1/1', '-1/1', '-1/-1']:
                     # Simple plane + noise
-                    u_slope = 0.1 if '1/' in str(mono) else -0.1
-                    v_slope = 0.1 if '/1' in str(mono) else -0.1
-                    if str(mono).startswith('-1/'): u_slope = -0.1
-                    if str(mono).endswith('/-1'): v_slope = -0.1
+                    # Parse slopes
+                    # x1 slope (first part)
+                    x1_slope = 0.1 if '1/' in str(mono) else -0.1
+                    if str(mono).startswith('-1/'): x1_slope = -0.1
                     
-                    vals = np.zeros((comp['n_rows'], comp['n_cols']))
-                    for r in range(comp['n_rows']):
-                        for c in range(comp['n_cols']):
-                            vals[r,c] = r * u_slope + c * v_slope
+                    # x2 slope (second part)
+                    x2_slope = 0.1 if '/1' in str(mono) else -0.1
                     
-            y_log += bilin_spl(data[comp['x1_var']], data[comp['x2_var']], 
-                               comp['knots_x1'], comp['knots_x2'], vals)
-            true_values.append(vals)
-            
-    y = np.exp(y_log)
-    y_obs = y * np.random.lognormal(0, 0.1, n_samples)
-    data['y'] = y_obs
-    data['w'] = np.random.uniform(0.5, 1.5, n_samples)
+                    # Construct a monotonic surface
+                    # U varies along columns (x2), V varies along rows (x1)
+                    rows, cols = comp['n_rows'], comp['n_cols']
+                    U, V = np.meshgrid(np.arange(cols), np.arange(rows))
+                    
+                    # Apply x1 slope to V (rows) and x2 slope to U (cols)
+                    vals = x1_slope * V + x2_slope * U + rng.normal(0, 0.05, (rows, cols))
+                    
+            # 2D interpolation for y_true contribution
+            # We use scipy's RegularGridInterpolator
+            contribution = bilin_spl(
+                data[comp['x1_var']], 
+                data[comp['x2_var']], 
+                comp['knots_x1'], 
+                comp['knots_x2'], 
+                vals
+            )
+            y_log += contribution
+            true_values.append(vals.flatten())
+
+    # Add noise
+    y_log += rng.normal(0, 0.1, n_samples)
     
-    return pd.DataFrame(data), true_values
+    # Generate weights (random)
+    w = rng.uniform(0.5, 1.5, n_samples)
+    
+    df = pd.DataFrame(data)
+    df['y'] = np.exp(y_log)
+    df['w'] = w
+    
+    return df, true_values
 
 # --- 3. Basis Matrix Construction (The Optimization) ---
 def precompute_basis(components, df):
@@ -574,7 +593,7 @@ def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
             
     return M.tocsr()
 
-def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0, state=None, callback=None):
+def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
     
@@ -594,26 +613,9 @@ def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
             res_l1 = ne.evaluate('sqrt(l1_strength * (abs(x) + epsilon))')
             res_data = np.concatenate([res_data, res_l1])
             
-    # Verbose logging
-    if state is not None:
-        state['n_fev'] += 1
-        # Only update every N evaluations to avoid UI overhead
-        if callback and state['n_fev'] % 5 == 0:
-            cost = 0.5 * np.sum(res_data**2)
-            msg = f"Fitting... Iter: {state['n_fev']}, Cost: {cost:.4e}"
-            
-            # Dynamic progress bar
-            # Map fitting progress (0 to max_nfev) to UI progress (0.6 to 0.9)
-            max_fev = state.get('max_nfev', 100)
-            # Cap at 0.99 relative progress (so 0.6 + 0.3 * 0.99 = 0.897)
-            rel_prog = min(state['n_fev'] / max_fev, 0.99)
-            ui_prog = 0.6 + 0.3 * rel_prog
-            
-            callback(ui_prog, msg)
-            
     return res_data
 
-def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0, state=None, callback=None):
+def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
     # 1. Reconstruct P and compute y_pred (needed for scaling)
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
@@ -626,14 +628,18 @@ def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
     # 3. Compute dP/dx = M (Sparse)
     M = get_parameter_jacobian_matrix(x, components, param_mapping, base_P)
     
-    # 4. Compute J = diag(scale) @ (A @ M)
-    # A @ M is sparse (1M x 114)
-    J_unscaled = A @ M
+    # OPTIMIZATION: Convert M to dense. M is (n_params x n_params), so it's small.
+    # A is (n_samples x n_params).
+    # A @ M_dense -> Dense result (n_samples x n_params).
+    # This avoids slow sparse-sparse multiplication and sparse diagonal scaling.
+    M_dense = M.toarray()
     
-    # Scale rows efficiently using sparse diagonal matrix multiplication
-    # J = diag(scale) @ J_unscaled
-    D = scipy.sparse.diags(scale)
-    J = D @ J_unscaled
+    # 4. Compute J = diag(scale) @ (A @ M)
+    J_unscaled = A @ M_dense
+    
+    # Scale rows efficiently using broadcasting (J is dense now)
+    # J = J_unscaled * scale[:, None]
+    J = J_unscaled * scale[:, np.newaxis]
     
     # 5. Regularization Jacobian
     if alpha > 0:
@@ -642,16 +648,16 @@ def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
         if l2_strength > 0:
             sqrt_l2 = np.sqrt(l2_strength)
             n_x = len(x)
-            J_l2 = scipy.sparse.eye(n_x) * sqrt_l2
-            J = scipy.sparse.vstack([J, J_l2])
+            J_l2 = np.eye(n_x) * sqrt_l2
+            J = np.vstack([J, J_l2])
             
         # L1: term is sqrt(lambda*|x|). Jacobian is diagonal.
         l1_strength = alpha * l1_ratio
         if l1_strength > 0:
             epsilon = 1e-8
             val = ne.evaluate('0.5 * sqrt(l1_strength / (abs(x) + epsilon)) * where(x >= 0, 1, -1)')
-            J_l1 = scipy.sparse.diags(val)
-            J = scipy.sparse.vstack([J, J_l1])
+            J_l1 = np.diag(val)
+            J = np.vstack([J, J_l1])
             
     return J
 
@@ -782,8 +788,29 @@ def plot_fitting_results(P, components, data, y_true, true_values):
 # Need to make components global or pass it to jacobian_func
 components = [] 
 
+def check_numba_status():
+    print("\n--- System Info ---")
+    try:
+        print(f"Numba version: {numba.__version__}")
+        print(f"Numexpr version: {ne.__version__}")
+        print(f"Scipy version: {scipy.__version__}")
+        print(f"Numpy version: {np.__version__}")
+        
+        # Check if Numba is actually compiling
+        @numba.jit(nopython=True)
+        def test_numba(x):
+            return x + 1
+        test_numba(1)
+        print("Numba compilation (nopython=True): SUCCESS")
+    except Exception as e:
+        print(f"Numba compilation FAILED: {e}")
+        print("WARNING: Code will run very slowly without Numba compilation.")
+    print("-------------------\n")
+
 def run_fitting():
     global components
+    check_numba_status()
+    
     print("Loading model structure...")
     components = load_model_spec()
     
@@ -801,7 +828,7 @@ def run_fitting():
     print(f"Optimization with {len(x0)} parameters...")
     start_time = time.time()
     
-    alpha = 0.1
+    alpha = 0.0 # Default to 0 to restore speed
     l1_ratio = 0.5
     
     res = scipy.optimize.least_squares(
@@ -942,6 +969,8 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     API version of run_fitting for GUI.
     """
     global components
+    check_numba_status()
+    
     if progress_callback: progress_callback(0.1, "Loading model structure...")
     components = load_model_spec(df=df_params)
     
@@ -959,23 +988,18 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     if progress_callback: progress_callback(0.6, f"Optimizing {len(x0)} parameters...")
     start_time = time.time()
     
-    alpha = 0.1
+    alpha = 0.0 # Default to 0 to restore speed
     l1_ratio = 0.5
-    
-    # State for verbose logging
-    max_nfev = 200 # Limit iterations for GUI responsiveness and progress bar scaling
-    fitting_state = {'n_fev': 0, 'start_time': start_time, 'max_nfev': max_nfev}
     
     res = scipy.optimize.least_squares(
         residual_func_fast,
         x0,
         jac=jacobian_func_fast,
         bounds=bounds,
-        args=(A, param_mapping, base_P, df_data['y'], df_data['w'], alpha, l1_ratio, fitting_state, progress_callback),
-        verbose=0, # Silent for GUI, we handle it manually
+        args=(A, param_mapping, base_P, df_data['y'], df_data['w'], alpha, l1_ratio),
+        verbose=0, # Silent for GUI
         method='trf',
-        x_scale='jac',
-        max_nfev=max_nfev
+        x_scale='jac'
     )
     
     elapsed = time.time() - start_time

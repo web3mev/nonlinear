@@ -7,8 +7,6 @@ import time
 import os
 import glob
 
-import psutil
-
 st.set_page_config(page_title="Nonlinear Fitting Tool", layout="wide")
 
 def get_next_version_filename(base_name="parameter_fitted"):
@@ -32,34 +30,6 @@ st.title("Nonlinear Fitting Tool")
 
 # --- Sidebar ---
 st.sidebar.header("Configuration")
-
-# System Monitor
-with st.sidebar.expander("System Monitor", expanded=True):
-    sys_placeholder = st.empty()
-    
-    def get_system_metrics():
-        cpu_per_core = psutil.cpu_percent(percpu=True)
-        mem = psutil.virtual_memory()
-        return cpu_per_core, mem
-
-    def display_metrics(placeholder):
-        cpu_per_core, mem = get_system_metrics()
-        with placeholder.container():
-            st.write(f"**Memory:** {mem.percent}% ({mem.used / (1024**3):.1f} / {mem.total / (1024**3):.1f} GB)")
-            st.write("**CPU per Core:**")
-            cols = st.columns(4)
-            for i, p in enumerate(cpu_per_core):
-                # Custom small metric display
-                cols[i % 4].markdown(
-                    f"<div style='line-height:1.2; margin-bottom:5px'>"
-                    f"<span style='font-size:0.8em; color:#888'>C{i}</span><br>"
-                    f"<span style='font-size:1.0em; font-weight:bold'>{p}%</span>"
-                    f"</div>", 
-                    unsafe_allow_html=True
-                )
-    
-    # Initial display
-    display_metrics(sys_placeholder)
 
 uploaded_param_file = st.sidebar.file_uploader("Upload Parameter File", type=["csv"])
 if uploaded_param_file:
@@ -160,8 +130,6 @@ if 'params_df' in st.session_state:
         def update_progress(p, text):
             progress_bar.progress(p)
             status_text.text(text)
-            # Update system metrics during fitting
-            display_metrics(sys_placeholder)
             
         # Data Handling Logic
         df_data = None
