@@ -9,8 +9,9 @@ import numba
 import numexpr as ne
 
 # --- 1. Model Specification Loading ---
-def load_model_spec(csv_path='parameters.csv'):
-    df = pd.read_csv(csv_path)
+def load_model_spec(csv_path='parameters.csv', df=None):
+    if df is None:
+        df = pd.read_csv(csv_path)
     df = df[df['On_Off'] == 'Y'].copy()
     
     components = []
@@ -573,13 +574,9 @@ def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
             
     return M.tocsr()
 
-def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0, state=None, callback=None):
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
-    
-    # Use Numexpr for exp and residual calculation
-    # y_pred = np.exp(y_log)
-    # res_data = (y_true - y_pred) / w
     
     # Numexpr expression
     res_data = ne.evaluate('(y_true - exp(y_log)) / w')
@@ -597,9 +594,26 @@ def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
             res_l1 = ne.evaluate('sqrt(l1_strength * (abs(x) + epsilon))')
             res_data = np.concatenate([res_data, res_l1])
             
+    # Verbose logging
+    if state is not None:
+        state['n_fev'] += 1
+        # Only update every N evaluations to avoid UI overhead
+        if callback and state['n_fev'] % 5 == 0:
+            cost = 0.5 * np.sum(res_data**2)
+            msg = f"Fitting... Iter: {state['n_fev']}, Cost: {cost:.4e}"
+            
+            # Dynamic progress bar
+            # Map fitting progress (0 to max_nfev) to UI progress (0.6 to 0.9)
+            max_fev = state.get('max_nfev', 100)
+            # Cap at 0.99 relative progress (so 0.6 + 0.3 * 0.99 = 0.897)
+            rel_prog = min(state['n_fev'] / max_fev, 0.99)
+            ui_prog = 0.6 + 0.3 * rel_prog
+            
+            callback(ui_prog, msg)
+            
     return res_data
 
-def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0, state=None, callback=None):
     # 1. Reconstruct P and compute y_pred (needed for scaling)
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
@@ -810,6 +824,220 @@ def run_fitting():
     print_fitted_parameters(P_final, components)
     plot_fitting_results(P_final, components, df, df['y'], true_values)
     print("Plots saved.")
+
+def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=None, residuals=None):
+    # Version that returns figures instead of saving them
+    figures = {}
+    
+    # If y_pred is not provided, compute it (fallback)
+    if y_pred is None:
+        A = precompute_basis(components, data)
+        y_log = A @ P
+        y_pred = np.exp(y_log)
+        
+    if residuals is None:
+        residuals = y_true - y_pred
+    
+    # Downsample for scatter plots if too large
+    n_points = len(y_true)
+    if n_points > 5000:
+        indices = np.random.choice(n_points, 5000, replace=False)
+        y_true_plot = y_true.iloc[indices] if hasattr(y_true, 'iloc') else y_true[indices]
+        y_pred_plot = y_pred[indices]
+        res_plot = residuals.iloc[indices] if hasattr(residuals, 'iloc') else residuals[indices]
+    else:
+        y_true_plot = y_true
+        y_pred_plot = y_pred
+        res_plot = residuals
+
+    fig = plt.figure(figsize=(10, 6))
+    plt.scatter(y_true_plot, y_pred_plot, alpha=0.3, s=10)
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    plt.xlabel('True Y')
+    plt.ylabel('Predicted Y')
+    plt.title(f'Actual vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    figures['Actual vs Predicted'] = fig
+    plt.close()
+    
+    curr_idx = 0
+    for i, comp in enumerate(components):
+        n = comp['n_params']
+        vals = P[curr_idx : curr_idx + n]
+        curr_idx += n
+        
+        t_vals = true_values[i] if true_values is not None else None
+        
+        if comp['type'] == 'DIM_1':
+            fig = plt.figure(figsize=(8, 5))
+            plt.plot(comp['knots'], vals, 'ro-', label='Fitted')
+            if t_vals is not None:
+                plt.plot(comp['knots'], t_vals, 'g--', label='True')
+            
+            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
+            y_grid = np.interp(x_grid, comp['knots'], vals)
+            plt.plot(x_grid, y_grid, 'b-', alpha=0.3)
+            
+            plt.title(f"{comp['name']}")
+            plt.legend()
+            figures[f"Component: {comp['name']}"] = fig
+            plt.close()
+            
+        elif comp['type'] == 'DIM_2':
+            # If true values exist, show side-by-side. Else show only fitted.
+            if t_vals is not None:
+                fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+                
+                grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+                im1 = axes[0].imshow(grid, origin='lower', aspect='auto',
+                           extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
+                                   comp['knots_x1'].min(), comp['knots_x1'].max()])
+                axes[0].set_title(f"{comp['name']} (Fitted)")
+                fig.colorbar(im1, ax=axes[0])
+                
+                t_grid = t_vals.reshape(comp['n_rows'], comp['n_cols'])
+                im2 = axes[1].imshow(t_grid, origin='lower', aspect='auto',
+                           extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
+                                   comp['knots_x1'].min(), comp['knots_x1'].max()])
+                axes[1].set_title(f"{comp['name']} (True)")
+                fig.colorbar(im2, ax=axes[1])
+            else:
+                fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+                im1 = ax.imshow(grid, origin='lower', aspect='auto',
+                           extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
+                                   comp['knots_x1'].min(), comp['knots_x1'].max()])
+                ax.set_title(f"{comp['name']} (Fitted)")
+                fig.colorbar(im1, ax=ax)
+            
+            figures[f"Component: {comp['name']}"] = fig
+            plt.close()
+
+    fig = plt.figure(figsize=(10, 6))
+    plt.scatter(y_pred_plot, res_plot, alpha=0.3, s=10)
+    plt.axhline(0, color='r', linestyle='--')
+    plt.xlabel('Predicted Y')
+    plt.ylabel('Residuals')
+    plt.title(f'Residuals vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    figures['Residuals vs Predicted'] = fig
+    plt.close()
+    
+    fig = plt.figure(figsize=(10, 6))
+    plt.hist(res_plot, bins=50, edgecolor='k', alpha=0.7)
+    plt.xlabel('Residual')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of Residuals')
+    figures['Histogram of Residuals'] = fig
+    plt.close()
+    
+    fig = plt.figure(figsize=(10, 6))
+    scipy.stats.probplot(res_plot, dist="norm", plot=plt)
+    plt.title('Q-Q Plot')
+    figures['Q-Q Plot'] = fig
+    plt.close()
+    
+    return figures
+
+def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback=None):
+    """
+    API version of run_fitting for GUI.
+    """
+    global components
+    if progress_callback: progress_callback(0.1, "Loading model structure...")
+    components = load_model_spec(df=df_params)
+    
+    if df_data is None:
+        if progress_callback: progress_callback(0.2, "Generating synthetic data...")
+        df_data, true_values = generate_data(components, n_samples=int(1e5)) # Smaller sample for GUI responsiveness
+    
+    if progress_callback: progress_callback(0.4, "Pre-computing Basis Matrix...")
+    t0 = time.time()
+    A = precompute_basis(components, df_data)
+    
+    if progress_callback: progress_callback(0.5, "Constructing parameters...")
+    x0, bounds, param_mapping, base_P = pack_parameters(components)
+    
+    if progress_callback: progress_callback(0.6, f"Optimizing {len(x0)} parameters...")
+    start_time = time.time()
+    
+    alpha = 0.1
+    l1_ratio = 0.5
+    
+    # State for verbose logging
+    max_nfev = 200 # Limit iterations for GUI responsiveness and progress bar scaling
+    fitting_state = {'n_fev': 0, 'start_time': start_time, 'max_nfev': max_nfev}
+    
+    res = scipy.optimize.least_squares(
+        residual_func_fast,
+        x0,
+        jac=jacobian_func_fast,
+        bounds=bounds,
+        args=(A, param_mapping, base_P, df_data['y'], df_data['w'], alpha, l1_ratio, fitting_state, progress_callback),
+        verbose=0, # Silent for GUI, we handle it manually
+        method='trf',
+        x_scale='jac',
+        max_nfev=max_nfev
+    )
+    
+    elapsed = time.time() - start_time
+    if progress_callback: progress_callback(0.9, f"Optimization finished in {elapsed:.4f} s")
+    
+    P_final = reconstruct_P(res.x, param_mapping, base_P)
+    
+    # Calculate Metrics
+    y_log_pred = A @ P_final
+    y_pred = np.exp(y_log_pred)
+    residuals = df_data['y'] - y_pred
+    
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((df_data['y'] - np.mean(df_data['y']))**2)
+    r2 = 1 - (ss_res / ss_tot)
+    rmse = np.sqrt(np.mean(residuals**2))
+    mae = np.mean(np.abs(residuals))
+    
+    metrics = {
+        'R2': r2,
+        'RMSE': rmse,
+        'MAE': mae,
+        'n_samples': len(df_data)
+    }
+    
+    # Generate output table
+    rows = []
+    curr_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        vals = P_final[curr_idx : curr_idx + n]
+        curr_idx += n
+        
+        if comp['type'] == 'DIM_0':
+            rows.append({'Parameter': comp['name'], 'X1_Knot': '-', 'X2_Knot': '-', 'Fitted_Value': vals[0]})
+        elif comp['type'] == 'DIM_1':
+            for k, v in zip(comp['knots'], vals):
+                rows.append({'Parameter': comp['name'], 'X1_Knot': k, 'X2_Knot': '-', 'Fitted_Value': v})
+        elif comp['type'] == 'DIM_2':
+            grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            for r in range(comp['n_rows']):
+                for c in range(comp['n_cols']):
+                    rows.append({'Parameter': comp['name'], 'X1_Knot': comp['knots_x1'][r], 'X2_Knot': comp['knots_x2'][c], 'Fitted_Value': grid[r, c]})
+    
+    df_results = pd.DataFrame(rows)
+    
+    if progress_callback: progress_callback(0.95, "Generating plots...")
+    # Pass computed y_pred and residuals to avoid re-computation
+    figures = plot_fitting_results_gui(P_final, components, df_data, df_data['y'], true_values, y_pred=y_pred, residuals=residuals)
+    
+    if progress_callback: progress_callback(1.0, "Done!")
+    
+    return {
+        'success': res.success,
+        'cost': res.cost,
+        'time': elapsed,
+        'metrics': metrics,
+        'fitted_params': df_results,
+        'figures': figures,
+        'data': df_data, # Return data in case we want to reuse it
+        'true_values': true_values
+    }
 
 if __name__ == "__main__":
     run_fitting()
