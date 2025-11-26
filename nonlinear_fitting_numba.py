@@ -1,0 +1,815 @@
+import pandas as pd
+import numpy as np
+import scipy.optimize
+import scipy.sparse
+import scipy.stats
+import time
+import matplotlib.pyplot as plt
+import numba
+import numexpr as ne
+
+# --- 1. Model Specification Loading ---
+def load_model_spec(csv_path='parameters.csv'):
+    df = pd.read_csv(csv_path)
+    df = df[df['On_Off'] == 'Y'].copy()
+    
+    components = []
+    
+    for rf_nm, group in df.groupby('RiskFactor_NM', sort=False):
+        first_row = group.iloc[0]
+        calc_type = first_row['Calc_Type']
+        sub_model = first_row['Sub_Model']
+        
+        comp = {
+            'name': rf_nm,
+            'type': calc_type,
+            'sub_model': sub_model,
+            'x1_var': first_row['X1_Var'],
+            'x2_var': first_row['X2_Var'] if pd.notna(first_row['X2_Var']) else None,
+            'monotonicity': str(first_row['Monotonicity']) if pd.notna(first_row['Monotonicity']) else None
+        }
+        
+        if calc_type == 'DIM_0':
+            comp['initial_value'] = group['RiskFactor'].iloc[0]
+            comp['fixed'] = group['Fixed'].iloc[0] == 'Y'
+            comp['key'] = group['Key'].iloc[0]
+            comp['n_params'] = 1
+            
+        elif calc_type == 'DIM_1':
+            comp['knots'] = group['X1_Val'].values
+            comp['initial_values'] = group['RiskFactor'].values
+            comp['fixed'] = group['Fixed'].values == 'Y'
+            comp['keys'] = group['Key'].values
+            comp['n_params'] = len(comp['knots'])
+            
+        elif calc_type == 'DIM_2':
+            knots_x1 = sorted(group['X1_Val'].unique())
+            knots_x2 = sorted(group['X2_Val'].unique())
+            comp['knots_x1'] = np.array(knots_x1)
+            comp['knots_x2'] = np.array(knots_x2)
+            comp['n_rows'] = len(knots_x1)
+            comp['n_cols'] = len(knots_x2)
+            comp['n_params'] = len(knots_x1) * len(knots_x2)
+            
+            grid_values = np.zeros((len(knots_x1), len(knots_x2)))
+            grid_fixed = np.zeros((len(knots_x1), len(knots_x2)), dtype=bool)
+            
+            for _, row in group.iterrows():
+                try:
+                    i = knots_x1.index(row['X1_Val'])
+                    j = knots_x2.index(row['X2_Val'])
+                    grid_values[i, j] = row['RiskFactor']
+                    grid_fixed[i, j] = row['Fixed'] == 'Y'
+                except ValueError:
+                    continue
+            
+            comp['initial_values'] = grid_values
+            comp['fixed'] = grid_fixed
+            
+        components.append(comp)
+        
+    return components
+
+# --- 2. Data Generation ---
+def generate_data(components, n_samples=int(1e6), seed=42):
+    np.random.seed(seed)
+    data = {}
+    
+    generated_vars = set()
+    
+    for comp in components:
+        for var_name, knots_key in [(comp['x1_var'], 'knots'), (comp['x1_var'], 'knots_x1'), (comp['x2_var'], 'knots_x2')]:
+            if var_name and var_name not in generated_vars:
+                if var_name in ['LVL', 'Intercept', 'INT']:
+                     data[var_name] = np.ones(n_samples)
+                else:
+                    # Try to find knots for range
+                    if knots_key in comp:
+                        k_min, k_max = comp[knots_key].min(), comp[knots_key].max()
+                        margin = (k_max - k_min) * 0.1 if k_max > k_min else 1.0
+                        data[var_name] = np.random.uniform(k_min - margin, k_max + margin, n_samples)
+                    else:
+                        data[var_name] = np.random.normal(0, 1, n_samples)
+                generated_vars.add(var_name)
+
+    # Calculate y_true
+    y_log = np.zeros(n_samples)
+    
+    # Helper splines
+    def lin_spl(x, k, v): return np.interp(x, k, v, left=v[0], right=v[-1])
+    def bilin_spl(u, v, ku, kv, vals):
+        from scipy.interpolate import RegularGridInterpolator
+        u_c = np.clip(u, ku[0], ku[-1])
+        v_c = np.clip(v, kv[0], kv[-1])
+        interp = RegularGridInterpolator((ku, kv), vals, bounds_error=False, fill_value=None)
+        return interp(np.column_stack((u_c, v_c)))
+
+    true_values = []
+
+    for comp in components:
+        # Generate a random "True" shape for this component
+        if comp['type'] == 'DIM_0':
+            # Use initial value if fixed, else random
+            if comp['fixed']:
+                val = comp['initial_value']
+            else:
+                val = np.random.uniform(-0.5, 0.5)
+            y_log += val * data[comp['x1_var']]
+            true_values.append(np.array([val]))
+            
+        elif comp['type'] == 'DIM_1':
+            if np.all(comp['fixed']):
+                vals = comp['initial_values']
+            else:
+                # Generate random curve
+                n_k = len(comp['knots'])
+                if comp['monotonicity'] in ['1', '1.0', 1]:
+                    vals = np.cumsum(np.random.uniform(0, 0.2, n_k))
+                    vals -= vals.mean() # Center
+                elif comp['monotonicity'] in ['-1', '-1.0', -1]:
+                    vals = np.cumsum(np.random.uniform(0, 0.2, n_k)) * -1
+                    vals -= vals.mean()
+                else:
+                    vals = np.random.uniform(-1, 1, n_k)
+            
+            y_log += lin_spl(data[comp['x1_var']], comp['knots'], vals)
+            true_values.append(vals)
+            
+        elif comp['type'] == 'DIM_2':
+            if np.all(comp['fixed']):
+                vals = comp['initial_values']
+            else:
+                # Random surface
+                vals = np.random.uniform(-0.5, 0.5, (comp['n_rows'], comp['n_cols']))
+                mono = comp['monotonicity']
+                if mono in ['1/-1', '1/1', '-1/1', '-1/-1']:
+                    # Simple plane + noise
+                    u_slope = 0.1 if '1/' in str(mono) else -0.1
+                    v_slope = 0.1 if '/1' in str(mono) else -0.1
+                    if str(mono).startswith('-1/'): u_slope = -0.1
+                    if str(mono).endswith('/-1'): v_slope = -0.1
+                    
+                    vals = np.zeros((comp['n_rows'], comp['n_cols']))
+                    for r in range(comp['n_rows']):
+                        for c in range(comp['n_cols']):
+                            vals[r,c] = r * u_slope + c * v_slope
+                    
+            y_log += bilin_spl(data[comp['x1_var']], data[comp['x2_var']], 
+                               comp['knots_x1'], comp['knots_x2'], vals)
+            true_values.append(vals)
+            
+    y = np.exp(y_log)
+    y_obs = y * np.random.lognormal(0, 0.1, n_samples)
+    data['y'] = y_obs
+    data['w'] = np.random.uniform(0.5, 1.5, n_samples)
+    
+    return pd.DataFrame(data), true_values
+
+# --- 3. Basis Matrix Construction (The Optimization) ---
+def precompute_basis(components, df):
+    basis_matrices = []
+    n_samples = len(df)
+    
+    for comp in components:
+        if comp['type'] == 'DIM_0':
+            col = df[comp['x1_var']].values.reshape(-1, 1)
+            basis_matrices.append(scipy.sparse.csr_matrix(col))
+            
+        elif comp['type'] == 'DIM_1':
+            x = df[comp['x1_var']].values
+            knots = comp['knots']
+            n_knots = len(knots)
+            
+            idx = np.searchsorted(knots, x, side='right') - 1
+            idx = np.clip(idx, 0, n_knots - 2)
+            
+            x0 = knots[idx]
+            x1 = knots[idx+1]
+            denom = x1 - x0
+            denom[denom == 0] = 1.0
+            t = np.clip((x - x0) / denom, 0.0, 1.0)
+            
+            rows = np.arange(n_samples)
+            cols_left = idx
+            vals_left = 1.0 - t
+            cols_right = idx + 1
+            vals_right = t
+            
+            all_rows = np.concatenate([rows, rows])
+            all_cols = np.concatenate([cols_left, cols_right])
+            all_vals = np.concatenate([vals_left, vals_right])
+            
+            mat = scipy.sparse.csr_matrix((all_vals, (all_rows, all_cols)), shape=(n_samples, n_knots))
+            basis_matrices.append(mat)
+            
+        elif comp['type'] == 'DIM_2':
+            u = df[comp['x1_var']].values
+            v = df[comp['x2_var']].values
+            knots_u = comp['knots_x1']
+            knots_v = comp['knots_x2']
+            n_rows = len(knots_u)
+            n_cols = len(knots_v)
+            
+            idx_u = np.searchsorted(knots_u, u, side='right') - 1
+            idx_u = np.clip(idx_u, 0, n_rows - 2)
+            u0 = knots_u[idx_u]
+            u1 = knots_u[idx_u+1]
+            denom_u = u1 - u0
+            denom_u[denom_u == 0] = 1.0
+            t_u = np.clip((u - u0) / denom_u, 0.0, 1.0)
+            
+            idx_v = np.searchsorted(knots_v, v, side='right') - 1
+            idx_v = np.clip(idx_v, 0, n_cols - 2)
+            v0 = knots_v[idx_v]
+            v1 = knots_v[idx_v+1]
+            denom_v = v1 - v0
+            denom_v[denom_v == 0] = 1.0
+            t_v = np.clip((v - v0) / denom_v, 0.0, 1.0)
+            
+            w00 = (1 - t_u) * (1 - t_v)
+            w10 = t_u * (1 - t_v)
+            w01 = (1 - t_u) * t_v
+            w11 = t_u * t_v
+            
+            rows = np.arange(n_samples)
+            cols00 = idx_u * n_cols + idx_v
+            cols10 = (idx_u + 1) * n_cols + idx_v
+            cols01 = idx_u * n_cols + (idx_v + 1)
+            cols11 = (idx_u + 1) * n_cols + (idx_v + 1)
+            
+            all_rows = np.concatenate([rows, rows, rows, rows])
+            all_cols = np.concatenate([cols00, cols10, cols01, cols11])
+            all_vals = np.concatenate([w00, w10, w01, w11])
+            
+            mat = scipy.sparse.csr_matrix((all_vals, (all_rows, all_cols)), shape=(n_samples, n_rows * n_cols))
+            basis_matrices.append(mat)
+            
+    A = scipy.sparse.hstack(basis_matrices, format='csr')
+    return A
+
+# --- 4. Parameter Packing & Unpacking ---
+
+# Numba optimized helper for 2D reconstruction and Jacobian
+@numba.jit(nopython=True)
+def compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols):
+    n_params = 1 + (rows - 1) + (cols - 1) + (rows - 1) * (cols - 1)
+    n_grid = rows * cols
+    
+    Z = np.zeros((rows, cols))
+    Jac = np.zeros((n_grid, n_params))
+    
+    # Param indices
+    idx_z00 = 0
+    start_du = 1
+    start_dv = start_du + (rows - 1)
+    start_dint = start_dv + (cols - 1)
+    
+    # (0,0)
+    Z[0,0] = z00
+    Jac[0, idx_z00] = 1.0
+    
+    # First col
+    curr = z00
+    for i in range(rows-1):
+        # Z[i+1, 0] = Z[i, 0] + d_u[i]
+        prev_idx = i * cols
+        curr_idx = (i + 1) * cols
+        
+        Z[i+1, 0] = Z[i, 0] + d_u[i]
+        
+        # Copy dependencies from prev
+        Jac[curr_idx] = Jac[prev_idx]
+        # Add current delta
+        Jac[curr_idx, start_du + i] = 1.0
+        
+    # First row
+    curr = z00
+    for j in range(cols-1):
+        # Z[0, j+1] = Z[0, j] + d_v[j]
+        prev_idx = j
+        curr_idx = j + 1
+        
+        Z[0, j+1] = Z[0, j] + d_v[j]
+        
+        Jac[curr_idx] = Jac[prev_idx]
+        Jac[curr_idx, start_dv + j] = 1.0
+        
+    # Internal
+    k = 0
+    for i in range(1, rows):
+        for j in range(1, cols):
+            curr_idx = i * cols + j
+            idx_up = (i - 1) * cols + j
+            idx_left = i * cols + (j - 1)
+            
+            val_up = Z[i-1, j]
+            val_left = Z[i, j-1]
+            
+            if val_up > val_left:
+                Z[i, j] = val_up + d_int[k]
+                Jac[curr_idx] = Jac[idx_up]
+            else:
+                Z[i, j] = val_left + d_int[k]
+                Jac[curr_idx] = Jac[idx_left]
+                
+            Jac[curr_idx, start_dint + k] = 1.0
+            k += 1
+            
+    return Z, Jac
+
+def pack_parameters(components):
+    x0 = []
+    bounds_lower = []
+    bounds_upper = []
+    param_mapping = [] 
+    
+    total_params = sum(c['n_params'] for c in components)
+    base_P = []
+    current_P_idx = 0
+    
+    for i, comp in enumerate(components):
+        start_P = current_P_idx
+        
+        if comp['type'] == 'DIM_0':
+            val = comp['initial_value']
+            fixed = comp['fixed']
+            base_P.append(val if fixed else 0.0)
+            
+            if not fixed:
+                x0.append(val)
+                bounds_lower.append(-np.inf)
+                bounds_upper.append(np.inf)
+                param_mapping.append(('direct', [start_P]))
+                
+        elif comp['type'] == 'DIM_1':
+            vals = comp['initial_values']
+            fixed = comp['fixed']
+            mono = comp['monotonicity']
+            
+            if mono in ['1', '1.0', 1]: # Increasing
+                if np.all(fixed):
+                    base_P.extend(vals)
+                else:
+                    base_P.extend(np.zeros_like(vals))
+                    x0.append(vals[0])
+                    bounds_lower.append(-np.inf)
+                    bounds_upper.append(np.inf)
+                    deltas = np.maximum(np.diff(vals), 0)
+                    for d in deltas:
+                        x0.append(d)
+                        bounds_lower.append(0.0)
+                        bounds_upper.append(np.inf)
+                    param_mapping.append(('mono_inc', start_P, len(vals)))
+                    
+            elif mono in ['-1', '-1.0', -1]: # Decreasing
+                if np.all(fixed):
+                    base_P.extend(vals)
+                else:
+                    base_P.extend(np.zeros_like(vals))
+                    x0.append(vals[0])
+                    bounds_lower.append(-np.inf)
+                    bounds_upper.append(np.inf)
+                    deltas = np.maximum(-np.diff(vals), 0)
+                    for d in deltas:
+                        x0.append(d)
+                        bounds_lower.append(0.0)
+                        bounds_upper.append(np.inf)
+                    param_mapping.append(('mono_dec', start_P, len(vals)))
+            else:
+                for j, val in enumerate(vals):
+                    if fixed[j]:
+                        base_P.append(val)
+                    else:
+                        base_P.append(0.0)
+                        x0.append(val)
+                        bounds_lower.append(-np.inf)
+                        bounds_upper.append(np.inf)
+                        param_mapping.append(('direct', [start_P + j]))
+                        
+        elif comp['type'] == 'DIM_2':
+            vals = comp['initial_values']
+            fixed = comp['fixed']
+            mono = comp['monotonicity']
+            rows, cols = vals.shape
+            
+            if mono in ['1/-1', '1/1', '-1/1', '-1/-1']:
+                if np.all(fixed):
+                    base_P.extend(vals.flatten())
+                else:
+                    base_P.extend(np.zeros(rows * cols))
+                    x0.append(vals[0,0]) # z00
+                    bounds_lower.append(-np.inf)
+                    bounds_upper.append(np.inf)
+                    for _ in range(rows-1):
+                        x0.append(0.1)
+                        bounds_lower.append(0.0)
+                        bounds_upper.append(np.inf)
+                    for _ in range(cols-1):
+                        x0.append(0.1)
+                        bounds_lower.append(0.0)
+                        bounds_upper.append(np.inf)
+                    for _ in range((rows-1)*(cols-1)):
+                        x0.append(0.1)
+                        bounds_lower.append(0.0)
+                        bounds_upper.append(np.inf)
+                    param_mapping.append(('mono_2d', start_P, rows, cols, mono))
+            else:
+                flat_vals = vals.flatten()
+                flat_fixed = fixed.flatten()
+                for j, val in enumerate(flat_vals):
+                    if flat_fixed[j]:
+                        base_P.append(val)
+                    else:
+                        base_P.append(0.0)
+                        x0.append(val)
+                        bounds_lower.append(-np.inf)
+                        bounds_upper.append(np.inf)
+                        param_mapping.append(('direct', [start_P + j]))
+                        
+        current_P_idx += comp['n_params']
+        
+    return np.array(x0), (np.array(bounds_lower), np.array(bounds_upper)), param_mapping, np.array(base_P)
+
+def reconstruct_P(x, param_mapping, base_P):
+    P = base_P.copy()
+    idx_ptr = 0
+    
+    for mapping in param_mapping:
+        m_type = mapping[0]
+        
+        if m_type == 'direct':
+            indices = mapping[1]
+            for idx in indices:
+                P[idx] = x[idx_ptr]
+                idx_ptr += 1
+                
+        elif m_type == 'mono_inc':
+            start_P, count = mapping[1], mapping[2]
+            v0 = x[idx_ptr]
+            deltas = x[idx_ptr+1 : idx_ptr+count]
+            idx_ptr += count
+            
+            vals = np.empty(count)
+            vals[0] = v0
+            np.cumsum(deltas, out=vals[1:])
+            vals[1:] += v0
+            P[start_P : start_P + count] = vals
+            
+        elif m_type == 'mono_dec':
+            start_P, count = mapping[1], mapping[2]
+            v0 = x[idx_ptr]
+            deltas = x[idx_ptr+1 : idx_ptr+count]
+            idx_ptr += count
+            
+            vals = np.empty(count)
+            vals[0] = v0
+            np.cumsum(deltas, out=vals[1:])
+            vals[1:] = v0 - vals[1:]
+            P[start_P : start_P + count] = vals
+            
+        elif m_type == 'mono_2d':
+            start_P, rows, cols, mode = mapping[1], mapping[2], mapping[3], mapping[4]
+            
+            z00 = x[idx_ptr]
+            idx_ptr += 1
+            
+            d_u = x[idx_ptr : idx_ptr + rows - 1]
+            idx_ptr += rows - 1
+            
+            d_v = x[idx_ptr : idx_ptr + cols - 1]
+            idx_ptr += cols - 1
+            
+            d_int = x[idx_ptr : idx_ptr + (rows-1)*(cols-1)]
+            idx_ptr += (rows-1)*(cols-1)
+            
+            # Use Numba optimized function
+            # We need to call the one that returns only Z, or modify this to unpack
+            # But compute_2d_jacobian_numba returns (Z, Jac).
+            # Let's just use that and discard Jac.
+            Z, _ = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
+            
+            # Transform based on mode
+            if mode == '1/-1': # Inc U, Dec V -> Flip V
+                Z = Z[:, ::-1]
+            elif mode == '-1/1': # Dec U, Inc V -> Flip U
+                Z = Z[::-1, :]
+            elif mode == '-1/-1': # Dec U, Dec V -> Flip both
+                Z = Z[::-1, ::-1]
+                
+            P[start_P : start_P + rows*cols] = Z.flatten()
+            
+    return P
+
+def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
+    """
+    Computes dP/dx (sparse matrix M).
+    P = M @ x + base_P (roughly, but 2D part is non-linear so M depends on x)
+    """
+    total_P = len(base_P)
+    total_x = len(x)
+    
+    # We construct M in LIL format then convert to CSR
+    M = scipy.sparse.lil_matrix((total_P, total_x))
+    
+    idx_ptr = 0
+    
+    for mapping in param_mapping:
+        m_type = mapping[0]
+        
+        if m_type == 'direct':
+            indices = mapping[1]
+            for idx in indices:
+                M[idx, idx_ptr] = 1.0
+                idx_ptr += 1
+                
+        elif m_type == 'mono_inc':
+            start_P, count = mapping[1], mapping[2]
+            
+            # v0 affects all
+            M[start_P : start_P + count, idx_ptr] = 1.0
+            
+            # deltas affect from their position onwards
+            for k in range(1, count):
+                M[start_P + k : start_P + count, idx_ptr + k] = 1.0
+                
+            idx_ptr += count
+            
+        elif m_type == 'mono_dec':
+            start_P, count = mapping[1], mapping[2]
+            
+            M[start_P : start_P + count, idx_ptr] = 1.0
+            
+            for k in range(1, count):
+                M[start_P + k : start_P + count, idx_ptr + k] = -1.0
+                
+            idx_ptr += count
+            
+        elif m_type == 'mono_2d':
+            start_P, rows, cols, mode = mapping[1], mapping[2], mapping[3], mapping[4]
+            n_params = rows * cols
+            
+            z00 = x[idx_ptr]
+            d_u = x[idx_ptr + 1 : idx_ptr + rows]
+            d_v = x[idx_ptr + rows : idx_ptr + rows + cols - 1]
+            d_int = x[idx_ptr + rows + cols - 1 : idx_ptr + n_params]
+            
+            _, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
+            
+            Jac_reshaped = Jac_local.reshape(rows, cols, n_params)
+            
+            if mode == '1/-1':
+                Jac_reshaped = Jac_reshaped[:, ::-1, :]
+            elif mode == '-1/1':
+                Jac_reshaped = Jac_reshaped[::-1, :, :]
+            elif mode == '-1/-1':
+                Jac_reshaped = Jac_reshaped[::-1, ::-1, :]
+                
+            Jac_final = Jac_reshaped.reshape(n_params, n_params)
+            
+            # Assign to M (LIL is fast for this)
+            M[start_P : start_P + n_params, idx_ptr : idx_ptr + n_params] = Jac_final
+            
+            idx_ptr += n_params
+            
+    return M.tocsr()
+
+def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+    P = reconstruct_P(x, param_mapping, base_P)
+    y_log = A @ P
+    
+    # Use Numexpr for exp and residual calculation
+    # y_pred = np.exp(y_log)
+    # res_data = (y_true - y_pred) / w
+    
+    # Numexpr expression
+    res_data = ne.evaluate('(y_true - exp(y_log)) / w')
+    
+    if alpha > 0:
+        l2_strength = alpha * (1.0 - l1_ratio)
+        if l2_strength > 0:
+            res_l2 = np.sqrt(l2_strength) * x
+            res_data = np.concatenate([res_data, res_l2])
+            
+        l1_strength = alpha * l1_ratio
+        if l1_strength > 0:
+            epsilon = 1e-8
+            # Numexpr for this too?
+            res_l1 = ne.evaluate('sqrt(l1_strength * (abs(x) + epsilon))')
+            res_data = np.concatenate([res_data, res_l1])
+            
+    return res_data
+
+def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+    # 1. Reconstruct P and compute y_pred (needed for scaling)
+    P = reconstruct_P(x, param_mapping, base_P)
+    y_log = A @ P
+    
+    y_pred = ne.evaluate('exp(y_log)')
+    
+    # 2. Compute scale = -y_pred / w
+    scale = ne.evaluate('-y_pred / w')
+    
+    # 3. Compute dP/dx = M (Sparse)
+    M = get_parameter_jacobian_matrix(x, components, param_mapping, base_P)
+    
+    # 4. Compute J = diag(scale) @ (A @ M)
+    # A @ M is sparse (1M x 114)
+    J_unscaled = A @ M
+    
+    # Scale rows efficiently using sparse diagonal matrix multiplication
+    # J = diag(scale) @ J_unscaled
+    D = scipy.sparse.diags(scale)
+    J = D @ J_unscaled
+    
+    # 5. Regularization Jacobian
+    if alpha > 0:
+        # L2: term is sqrt(lambda)*x. Jacobian is sqrt(lambda)*I.
+        l2_strength = alpha * (1.0 - l1_ratio)
+        if l2_strength > 0:
+            sqrt_l2 = np.sqrt(l2_strength)
+            n_x = len(x)
+            J_l2 = scipy.sparse.eye(n_x) * sqrt_l2
+            J = scipy.sparse.vstack([J, J_l2])
+            
+        # L1: term is sqrt(lambda*|x|). Jacobian is diagonal.
+        l1_strength = alpha * l1_ratio
+        if l1_strength > 0:
+            epsilon = 1e-8
+            val = ne.evaluate('0.5 * sqrt(l1_strength / (abs(x) + epsilon)) * where(x >= 0, 1, -1)')
+            J_l1 = scipy.sparse.diags(val)
+            J = scipy.sparse.vstack([J, J_l1])
+            
+    return J
+
+# --- 5. Output ---
+def print_fitted_parameters(P, components):
+    print("\n--- Fitted Parameters Table ---")
+    rows = []
+    curr_idx = 0
+    
+    for comp in components:
+        n = comp['n_params']
+        vals = P[curr_idx : curr_idx + n]
+        curr_idx += n
+        
+        if comp['type'] == 'DIM_0':
+            rows.append({
+                'Parameter': comp['name'],
+                'X1_Knot': '-',
+                'X2_Knot': '-',
+                'Fitted_Value': vals[0]
+            })
+            
+        elif comp['type'] == 'DIM_1':
+            for k, v in zip(comp['knots'], vals):
+                rows.append({
+                    'Parameter': comp['name'],
+                    'X1_Knot': k,
+                    'X2_Knot': '-',
+                    'Fitted_Value': v
+                })
+                
+        elif comp['type'] == 'DIM_2':
+            grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            for r in range(comp['n_rows']):
+                for c in range(comp['n_cols']):
+                    rows.append({
+                        'Parameter': comp['name'],
+                        'X1_Knot': comp['knots_x1'][r],
+                        'X2_Knot': comp['knots_x2'][c],
+                        'Fitted_Value': grid[r, c]
+                    })
+    
+    df_results = pd.DataFrame(rows)
+    pd.options.display.float_format = '{:.4f}'.format
+    print(df_results.to_string(index=False))
+
+def plot_fitting_results(P, components, data, y_true, true_values):
+    A = precompute_basis(components, data)
+    y_log = A @ P
+    y_pred = np.exp(y_log)
+    
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_true, y_pred, alpha=0.3, s=10)
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    plt.xlabel('True Y')
+    plt.ylabel('Predicted Y')
+    plt.title('Actual vs Predicted')
+    plt.savefig('fit_actual_vs_pred_numba.png')
+    plt.close()
+    
+    curr_idx = 0
+    for i, comp in enumerate(components):
+        n = comp['n_params']
+        vals = P[curr_idx : curr_idx + n]
+        curr_idx += n
+        
+        t_vals = true_values[i]
+        
+        if comp['type'] == 'DIM_1':
+            plt.figure(figsize=(8, 5))
+            plt.plot(comp['knots'], vals, 'ro-', label='Fitted')
+            plt.plot(comp['knots'], t_vals, 'g--', label='True')
+            
+            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
+            y_grid = np.interp(x_grid, comp['knots'], vals)
+            plt.plot(x_grid, y_grid, 'b-', alpha=0.3)
+            
+            plt.title(f"{comp['name']}")
+            plt.legend()
+            plt.savefig(f"fit_plot_numba_{comp['name']}.png")
+            plt.close()
+        elif comp['type'] == 'DIM_2':
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            
+            grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            im1 = axes[0].imshow(grid, origin='lower', aspect='auto',
+                       extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
+                               comp['knots_x1'].min(), comp['knots_x1'].max()])
+            axes[0].set_title(f"{comp['name']} (Fitted)")
+            fig.colorbar(im1, ax=axes[0])
+            
+            t_grid = t_vals.reshape(comp['n_rows'], comp['n_cols'])
+            im2 = axes[1].imshow(t_grid, origin='lower', aspect='auto',
+                       extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
+                               comp['knots_x1'].min(), comp['knots_x1'].max()])
+            axes[1].set_title(f"{comp['name']} (True)")
+            fig.colorbar(im2, ax=axes[1])
+            
+            plt.savefig(f"fit_plot_numba_{comp['name']}.png")
+            plt.close()
+
+    residuals = y_true - y_pred
+    
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_pred, residuals, alpha=0.3, s=10)
+    plt.axhline(0, color='r', linestyle='--')
+    plt.xlabel('Predicted Y')
+    plt.ylabel('Residuals')
+    plt.title('Residuals vs Predicted')
+    plt.savefig('fit_residuals_vs_pred_numba.png')
+    plt.close()
+    
+    plt.figure(figsize=(10, 6))
+    plt.hist(residuals, bins=50, edgecolor='k', alpha=0.7)
+    plt.xlabel('Residual')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of Residuals')
+    plt.savefig('fit_residuals_hist_numba.png')
+    plt.close()
+    
+    plt.figure(figsize=(10, 6))
+    scipy.stats.probplot(residuals, dist="norm", plot=plt)
+    plt.title('Q-Q Plot')
+    plt.savefig('fit_qq_plot_numba.png')
+    plt.close()
+
+# --- 6. Main ---
+# Need to make components global or pass it to jacobian_func
+components = [] 
+
+def run_fitting():
+    global components
+    print("Loading model structure...")
+    components = load_model_spec()
+    
+    print("Generating synthetic data (1M samples)...")
+    df, true_values = generate_data(components, n_samples=int(1e6))
+    
+    print("Pre-computing Basis Matrix A...")
+    t0 = time.time()
+    A = precompute_basis(components, df)
+    print(f"Basis Matrix constructed in {time.time()-t0:.4f} s. Shape: {A.shape}")
+    
+    print("Constructing parameters...")
+    x0, bounds, param_mapping, base_P = pack_parameters(components)
+    
+    print(f"Optimization with {len(x0)} parameters...")
+    start_time = time.time()
+    
+    alpha = 0.1
+    l1_ratio = 0.5
+    
+    res = scipy.optimize.least_squares(
+        residual_func_fast,
+        x0,
+        jac=jacobian_func_fast,
+        bounds=bounds,
+        args=(A, param_mapping, base_P, df['y'], df['w'], alpha, l1_ratio),
+        verbose=2,
+        method='trf',
+        x_scale='jac' # Helps with scaling
+    )
+    
+    elapsed = time.time() - start_time
+    print(f"\nOptimization finished in {elapsed:.4f} s")
+    print(f"Success: {res.success}")
+    print(f"Cost: {res.cost}")
+    
+    P_final = reconstruct_P(res.x, param_mapping, base_P)
+    print_fitted_parameters(P_final, components)
+    plot_fitting_results(P_final, components, df, df['y'], true_values)
+    print("Plots saved.")
+
+if __name__ == "__main__":
+    run_fitting()
