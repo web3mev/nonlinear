@@ -153,6 +153,17 @@ if 'params_df' in st.session_state:
                         df_data = df_loaded.sample(n=sample_size)
                     else:
                         df_data = df_loaded
+                    
+                    # Weight Calculation
+                    if 'balance' in df_data.columns:
+                        # w = 1 / sqrt(balance)
+                        # Handle zeros/negatives by clipping to small epsilon
+                        balance = df_data['balance'].clip(lower=1e-6)
+                        df_data['w'] = 1.0 / np.sqrt(balance)
+                        update_progress(0.18, "Calculated weights from 'balance' column.")
+                    elif 'w' not in df_data.columns:
+                        df_data['w'] = 1.0
+                        update_progress(0.18, "No 'balance' or 'w' column found. Using default weights (1.0).")
                         
                 except Exception as e:
                     st.error(f"Failed to load data file: {e}")
@@ -227,7 +238,16 @@ if 'params_df' in st.session_state:
         with c4:
             st.pyplot(figures['Q-Q Plot'])
         
-        # Component Plots
+        # Performance Charts (New Section)
+        st.subheader("Performance Charts (Weighted Actual vs Model)")
+        perf_figs = {k: v for k, v in figures.items() if k.startswith("Performance:")}
+        if perf_figs:
+            cols = st.columns(2)
+            for i, (name, fig) in enumerate(perf_figs.items()):
+                with cols[i % 2]:
+                    st.pyplot(fig)
+        
+        # Component Plots (Fitted Curves/Surfaces)
         st.subheader("Component Plots")
         comp_figs = {k: v for k, v in figures.items() if k.startswith("Component:")}
         cols = st.columns(2)

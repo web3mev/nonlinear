@@ -7,6 +7,21 @@ import time
 import matplotlib.pyplot as plt
 import numba
 import numexpr as ne
+import os
+
+def configure_threading():
+    try:
+        n_cores = os.cpu_count()
+        ne.set_num_threads(n_cores)
+        print(f"\n--- Threading Configuration ---")
+        print(f"Detected Cores: {n_cores}")
+        print(f"Numexpr Threads set to: {ne.nthreads}")
+        
+        # Check BLAS threads (informational)
+        print("Tip: For maximum performance, set OMP_NUM_THREADS environment variable before running.")
+        print("-------------------------------\n")
+    except Exception as e:
+        print(f"Threading config failed: {e}")
 
 # --- 1. Model Specification Loading ---
 def load_model_spec(csv_path='parameters.csv', df=None):
@@ -810,6 +825,7 @@ def check_numba_status():
 def run_fitting():
     global components
     check_numba_status()
+    configure_threading()
     
     print("Loading model structure...")
     components = load_model_spec()
@@ -886,6 +902,142 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     figures['Actual vs Predicted'] = fig
     plt.close()
     
+    # Helper to calculate weighted averages using linear distribution to knots
+    def get_centered_weighted_stats(x_col, y_col, w_col, knots):
+        # Ensure knots are sorted and unique
+        sorted_knots = np.sort(np.unique(knots))
+        n_knots = len(sorted_knots)
+        
+        if n_knots == 0:
+            return pd.DataFrame({'x': [], 'y_mean': []})
+            
+        if n_knots == 1:
+            # Single knot: all weight goes to it
+            w_sum = w_col.sum()
+            y_weighted = (y_col * w_col).sum() / w_sum if w_sum > 0 else np.nan
+            return pd.DataFrame({'x': sorted_knots, 'y_mean': [y_weighted]})
+            
+        # Initialize accumulators for numerator (y*w) and denominator (w)
+        num = np.zeros(n_knots)
+        den = np.zeros(n_knots)
+        
+        x_data = data[x_col].values
+        y_data = y_col.values if hasattr(y_col, 'values') else y_col
+        w_data = w_col.values if hasattr(w_col, 'values') else w_col
+        
+        # Find indices of the intervals
+        # idx[i] is such that knots[idx[i]-1] <= x_data[i] < knots[idx[i]]
+        # We want left knot index j such that knots[j] <= x < knots[j+1]
+        # np.searchsorted(side='right') gives index where x should be inserted to maintain order.
+        # If x is in [k_j, k_{j+1}), searchsorted returns j+1.
+        # So left knot index is idx - 1.
+        
+        idx = np.searchsorted(sorted_knots, x_data, side='right') - 1
+        
+        # Clip indices to valid range [0, n_knots-2] for interpolation
+        # Points < min(knots) go to first interval (extrapolation/clamping)
+        # Points >= max(knots) go to last interval
+        idx = np.clip(idx, 0, n_knots - 2)
+        
+        # Calculate weights
+        k_left = sorted_knots[idx]
+        k_right = sorted_knots[idx + 1]
+        
+        # Avoid division by zero if knots are identical (shouldn't happen due to unique)
+        span = k_right - k_left
+        # Fraction of distance from left knot. 
+        # If x < k_left, alpha < 0. If x > k_right, alpha > 1.
+        # We clamp alpha to [0, 1] so points outside range are assigned fully to nearest knot.
+        alpha = (x_data - k_left) / span
+        alpha = np.clip(alpha, 0.0, 1.0)
+        
+        w_right = alpha  # Weight for right knot
+        w_left = 1.0 - alpha # Weight for left knot
+        
+        # Accumulate weighted sums
+        # Left knot contributions
+        np.add.at(num, idx, w_left * w_data * y_data)
+        np.add.at(den, idx, w_left * w_data)
+        
+        # Right knot contributions
+        np.add.at(num, idx + 1, w_right * w_data * y_data)
+        np.add.at(den, idx + 1, w_right * w_data)
+        
+        # Calculate means
+        y_means = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+        
+        return pd.DataFrame({'x': sorted_knots, 'y_mean': y_means})
+
+    def get_centered_weighted_stats_2d(x1_col, x2_col, y_col, w_col, knots_x1, knots_x2):
+        # Sort knots
+        ks1 = np.sort(np.unique(knots_x1))
+        ks2 = np.sort(np.unique(knots_x2))
+        n1, n2 = len(ks1), len(ks2)
+        
+        # Initialize grid accumulators
+        num = np.zeros((n1, n2))
+        den = np.zeros((n1, n2))
+        
+        x1_data = data[x1_col].values
+        x2_data = data[x2_col].values
+        y_data = y_col.values if hasattr(y_col, 'values') else y_col
+        w_data = w_col.values if hasattr(w_col, 'values') else w_col
+        
+        # 1. Find intervals for X1
+        if n1 > 1:
+            idx1 = np.searchsorted(ks1, x1_data, side='right') - 1
+            idx1 = np.clip(idx1, 0, n1 - 2)
+            span1 = ks1[idx1 + 1] - ks1[idx1]
+            alpha1 = np.clip((x1_data - ks1[idx1]) / span1, 0.0, 1.0)
+            w1_right = alpha1
+            w1_left = 1.0 - alpha1
+        else:
+            idx1 = np.zeros(len(x1_data), dtype=int)
+            w1_left = np.ones(len(x1_data))
+            w1_right = np.zeros(len(x1_data)) # No right neighbor
+            
+        # 2. Find intervals for X2
+        if n2 > 1:
+            idx2 = np.searchsorted(ks2, x2_data, side='right') - 1
+            idx2 = np.clip(idx2, 0, n2 - 2)
+            span2 = ks2[idx2 + 1] - ks2[idx2]
+            alpha2 = np.clip((x2_data - ks2[idx2]) / span2, 0.0, 1.0)
+            w2_right = alpha2
+            w2_left = 1.0 - alpha2
+        else:
+            idx2 = np.zeros(len(x2_data), dtype=int)
+            w2_left = np.ones(len(x2_data))
+            w2_right = np.zeros(len(x2_data))
+            
+        # 3. Accumulate to 4 corners (Bilinear interpolation weights)
+        # Corner (i, j): w1_left * w2_left
+        np.add.at(num, (idx1, idx2), w1_left * w2_left * w_data * y_data)
+        np.add.at(den, (idx1, idx2), w1_left * w2_left * w_data)
+        
+        if n1 > 1:
+            # Corner (i+1, j): w1_right * w2_left
+            np.add.at(num, (idx1 + 1, idx2), w1_right * w2_left * w_data * y_data)
+            np.add.at(den, (idx1 + 1, idx2), w1_right * w2_left * w_data)
+            
+        if n2 > 1:
+            # Corner (i, j+1): w1_left * w2_right
+            np.add.at(num, (idx1, idx2 + 1), w1_left * w2_right * w_data * y_data)
+            np.add.at(den, (idx1, idx2 + 1), w1_left * w2_right * w_data)
+            
+        if n1 > 1 and n2 > 1:
+            # Corner (i+1, j+1): w1_right * w2_right
+            np.add.at(num, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data * y_data)
+            np.add.at(den, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data)
+            
+        grid = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+        return grid
+
+    # Get balance for weighting
+    if 'balance' in data.columns:
+        weights = data['balance']
+    else:
+        weights = np.ones(len(data))
+
     curr_idx = 0
     for i, comp in enumerate(components):
         n = comp['n_params']
@@ -895,48 +1047,156 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
         t_vals = true_values[i] if true_values is not None else None
         
         if comp['type'] == 'DIM_1':
-            fig = plt.figure(figsize=(8, 5))
+            # --- Performance Chart ---
+            fig_perf = plt.figure(figsize=(10, 6))
+            
+            # Plot Weighted Actuals
+            stats_act = get_centered_weighted_stats(comp['x1_var'], data['y'], weights, comp['knots'])
+            plt.plot(stats_act['x'], stats_act['y_mean'], 'rs--', label='Weighted Actual', alpha=0.7)
+            
+            # Plot Weighted Model
+            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'])
+            plt.plot(stats_mod['x'], stats_mod['y_mean'], 'gs--', label='Weighted Model', alpha=0.7)
+            
+            # Plot Theoretical Model (Continuous) - REMOVED
+            # model_values = np.exp(vals)
+            # plt.plot(comp['knots'], model_values, 'b:', label='Theoretical Model', alpha=0.5)
+            
+            # Count bins with data
+            n_bins_with_data = stats_act['y_mean'].notna().sum()
+            plt.title(f"{comp['name']} - Performance ({len(comp['knots'])} knots, {n_bins_with_data} with data)")
+            plt.xlabel(comp['x1_var'])
+            plt.ylabel('Response')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            figures[f"Performance: {comp['name']}"] = fig_perf
+            plt.close()
+            
+            # --- Component Plot (Restored) ---
+            fig_comp = plt.figure(figsize=(8, 5))
+            
+            # Recalculate spline for component plot
+            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
+            y_grid = np.interp(x_grid, comp['knots'], vals)
+            
             plt.plot(comp['knots'], vals, 'ro-', label='Fitted')
             if t_vals is not None:
                 plt.plot(comp['knots'], t_vals, 'g--', label='True')
             
-            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
-            y_grid = np.interp(x_grid, comp['knots'], vals)
             plt.plot(x_grid, y_grid, 'b-', alpha=0.3)
-            
             plt.title(f"{comp['name']}")
             plt.legend()
-            figures[f"Component: {comp['name']}"] = fig
+            figures[f"Component: {comp['name']}"] = fig_comp
             plt.close()
             
         elif comp['type'] == 'DIM_2':
+            # --- Performance Charts (Slices) ---
+            # Calculate Weighted Actual and Model Grids
+            grid_actual = get_centered_weighted_stats_2d(
+                comp['x1_var'], comp['x2_var'], data['y'], weights, comp['knots_x1'], comp['knots_x2']
+            )
+            grid_model = get_centered_weighted_stats_2d(
+                comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2']
+            )
+            
+            # Helper to create subplot grid
+            def create_slice_grid(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis):
+                n_slices = len(slice_knots)
+                n_cols = 3
+                n_rows = int(np.ceil(n_slices / n_cols))
+                
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), constrained_layout=True)
+                axes = np.atleast_1d(axes).flatten()
+                
+                for i in range(n_slices):
+                    ax = axes[i]
+                    slice_val = slice_knots[i]
+                    
+                    # Extract slice data
+                    if slice_axis == 0: # Slicing X1 (rows), plotting along X2
+                        y_act = grid_act[i, :]
+                        y_mod = grid_mod[i, :]
+                    else: # Slicing X2 (cols), plotting along X1
+                        y_act = grid_act[:, i]
+                        y_mod = grid_mod[:, i]
+                        
+                    # Plot
+                    ax.plot(x_knots, y_act, 'rs--', label='Weighted Actual', alpha=0.7)
+                    ax.plot(x_knots, y_mod, 'gs--', label='Weighted Model', alpha=0.7)
+                    
+                    # Count data points (non-nan)
+                    n_data = np.sum(~np.isnan(y_act))
+                    
+                    ax.set_title(f"{slices_dim_name} = {slice_val:.4g}\n({n_data}/{len(x_knots)} pts)")
+                    ax.set_xlabel(x_axis_name)
+                    ax.set_ylabel('Response')
+                    if i == 0: ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    
+                # Hide unused subplots
+                for i in range(n_slices, len(axes)):
+                    axes[i].axis('off')
+                    
+                return fig
+
+            # 1. Slices along X2 (Fixed X1)
+            fig1 = create_slice_grid(
+                slices_dim_name=comp['x1_var'],
+                x_axis_name=comp['x2_var'],
+                x_knots=comp['knots_x2'],
+                slice_knots=comp['knots_x1'],
+                grid_act=grid_actual,
+                grid_mod=grid_model,
+                slice_axis=0
+            )
+            figures[f"Performance: {comp['name']} (By {comp['x1_var']})"] = fig1
+            plt.close()
+            
+            # 2. Slices along X1 (Fixed X2)
+            fig2 = create_slice_grid(
+                slices_dim_name=comp['x2_var'],
+                x_axis_name=comp['x1_var'],
+                x_knots=comp['knots_x1'],
+                slice_knots=comp['knots_x2'],
+                grid_act=grid_actual,
+                grid_mod=grid_model,
+                slice_axis=1
+            )
+            figures[f"Performance: {comp['name']} (By {comp['x2_var']})"] = fig2
+            plt.close()
+            
+            # Keep the surface plots as well? User said "create a grid... the same way as 1D charts".
+            # The slice grids replace the marginals/surfaces effectively for detailed view.
+            # I will omit the surface plots to avoid clutter, as the slices provide the requested view.
+            
+            # --- Component Plot (Restored) ---
             # If true values exist, show side-by-side. Else show only fitted.
             if t_vals is not None:
-                fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+                fig_hm, axes = plt.subplots(1, 2, figsize=(16, 6))
                 
                 grid = vals.reshape(comp['n_rows'], comp['n_cols'])
                 im1 = axes[0].imshow(grid, origin='lower', aspect='auto',
                            extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
                                    comp['knots_x1'].min(), comp['knots_x1'].max()])
                 axes[0].set_title(f"{comp['name']} (Fitted)")
-                fig.colorbar(im1, ax=axes[0])
+                fig_hm.colorbar(im1, ax=axes[0])
                 
                 t_grid = t_vals.reshape(comp['n_rows'], comp['n_cols'])
                 im2 = axes[1].imshow(t_grid, origin='lower', aspect='auto',
                            extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
                                    comp['knots_x1'].min(), comp['knots_x1'].max()])
                 axes[1].set_title(f"{comp['name']} (True)")
-                fig.colorbar(im2, ax=axes[1])
+                fig_hm.colorbar(im2, ax=axes[1])
             else:
-                fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                fig_hm, ax = plt.subplots(1, 1, figsize=(8, 6))
                 grid = vals.reshape(comp['n_rows'], comp['n_cols'])
                 im1 = ax.imshow(grid, origin='lower', aspect='auto',
                            extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
                                    comp['knots_x1'].min(), comp['knots_x1'].max()])
                 ax.set_title(f"{comp['name']} (Fitted)")
-                fig.colorbar(im1, ax=ax)
+                fig_hm.colorbar(im1, ax=ax)
             
-            figures[f"Component: {comp['name']}"] = fig
+            figures[f"Component: {comp['name']}"] = fig_hm
             plt.close()
 
     fig = plt.figure(figsize=(10, 6))
@@ -970,6 +1230,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     """
     global components
     check_numba_status()
+    configure_threading()
     
     if progress_callback: progress_callback(0.1, "Loading model structure...")
     components = load_model_spec(df=df_params)
