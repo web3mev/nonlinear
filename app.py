@@ -226,13 +226,12 @@ if 'params_df' in st.session_state:
         figures = results['figures']
         
         # Summary Plots
-        c1, c2 = st.columns(2)
+        # Summary Plots
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.pyplot(figures['Actual vs Predicted'])
         with c2:
             st.pyplot(figures['Residuals vs Predicted'])
-            
-        c3, c4 = st.columns(2)
         with c3:
             st.pyplot(figures['Histogram of Residuals'])
         with c4:
@@ -242,17 +241,17 @@ if 'params_df' in st.session_state:
         st.subheader("Performance Charts (Weighted Actual vs Model)")
         perf_figs = {k: v for k, v in figures.items() if k.startswith("Performance:")}
         if perf_figs:
-            cols = st.columns(2)
+            cols = st.columns(4)
             for i, (name, fig) in enumerate(perf_figs.items()):
-                with cols[i % 2]:
+                with cols[i % 4]:
                     st.pyplot(fig)
         
         # Component Plots (Fitted Curves/Surfaces)
         st.subheader("Component Plots")
         comp_figs = {k: v for k, v in figures.items() if k.startswith("Component:")}
-        cols = st.columns(2)
+        cols = st.columns(4)
         for i, (name, fig) in enumerate(comp_figs.items()):
-            with cols[i % 2]:
+            with cols[i % 4]:
                 st.pyplot(fig)
             
         st.markdown("---")

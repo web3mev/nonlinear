@@ -94,13 +94,25 @@ def generate_data(components, n_samples=int(1e6), seed=42):
     generated_vars = set()
     
     for comp in components:
-        for var_name, knots_key in [(comp['x1_var'], 'knots'), (comp['x1_var'], 'knots_x1'), (comp['x2_var'], 'knots_x2')]:
+
+        # Determine which variables and knot keys to check based on component type
+        vars_to_check = []
+        if comp['type'] == 'DIM_1':
+            vars_to_check.append((comp['x1_var'], 'knots'))
+        elif comp['type'] == 'DIM_2':
+            vars_to_check.append((comp['x1_var'], 'knots_x1'))
+            vars_to_check.append((comp['x2_var'], 'knots_x2'))
+        else:
+            # DIM_0 or others
+            vars_to_check.append((comp['x1_var'], None))
+
+        for var_name, knots_key in vars_to_check:
             if var_name and var_name not in generated_vars:
                 if var_name in ['LVL', 'Intercept', 'INT']:
                      data[var_name] = np.ones(n_samples)
                 else:
                     # Try to find knots for range
-                    if knots_key in comp:
+                    if knots_key and knots_key in comp:
                         k_min, k_max = comp[knots_key].min(), comp[knots_key].max()
                         margin = (k_max - k_min) * 0.1 if k_max > k_min else 1.0
                         data[var_name] = rng.uniform(k_min - margin, k_max + margin, n_samples)
@@ -189,7 +201,7 @@ def generate_data(components, n_samples=int(1e6), seed=42):
             true_values.append(vals.flatten())
 
     # Add noise
-    y_log += rng.normal(0, 0.1, n_samples)
+    y_log += rng.normal(0, 0.5, n_samples)
     
     # Generate weights (random)
     w = rng.uniform(0.5, 1.5, n_samples)

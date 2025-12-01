@@ -1,0 +1,87 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Model Explanation</title>
+    <style>
+        body { font-family: sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1, h2, h3 { color: #333; }
+        code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+        pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+    </style>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<h1>Model Formula and Monotonicity Constraints</h1>
+<p>This document explains the mathematical formulation of the nonlinear fitting model and how monotonicity constraints are enforced for 1D and 2D parameters.</p>
+<h2>1. Model Overview</h2>
+<p>The model predicts a response variable $Y$ based on a set of risk factors (parameters). The relationship is modeled as:</p>
+<p>$$ Y = \exp\left( \sum_{k} f_k(X_k) \right) \cdot \epsilon $$</p>
+<p>Taking the logarithm, we get a linear additive model:</p>
+<p>$$ \ln(Y) = \sum_{k} f_k(X_k) + \ln(\epsilon) $$</p>
+<p>where $f_k(X_k)$ is the contribution of the $k$-th risk factor. The function $f_k$ can be:</p>
+<ul>
+<li><strong>DIM_0</strong>: A linear term $f(x) = \beta \cdot x$.</li>
+<li><strong>DIM_1</strong>: A piecewise linear function (spline) of one variable.</li>
+<li><strong>DIM_2</strong>: A piecewise bilinear surface of two variables.</li>
+</ul>
+<h2>2. One-Dimensional Monotonicity (DIM_1)</h2>
+<p>For a 1D parameter with knots $k_0, k_1, \dots, k_n$, the function values at the knots are $v_0, v_1, \dots, v_n$. The function is interpolated linearly between knots.</p>
+<h3>Monotonic Increasing</h3>
+<p>To enforce that the function is monotonically increasing ($v_{i+1} \ge v_i$), we parameterize the values using non-negative increments (deltas):</p>
+<p>$$ v<em i-1="i-1">0 = P_0 $$
+$$ v_i = v</em> i=1 \dots n $$} + \delta_i \quad \text{for </p>
+<p>where $\delta_i \ge 0$.</p>
+<p>In the optimization, we solve for $P_0$ (unbounded) and $\delta_1, \dots, \delta_n$ (lower bound 0).</p>
+<h3>Monotonic Decreasing</h3>
+<p>Similarly, for monotonically decreasing functions:</p>
+<p>$$ v<em i-1="i-1">i = v</em> i=1 \dots n $$} - \delta_i \quad \text{for </p>
+<p>where $\delta_i \ge 0$.</p>
+<h2>3. Two-Dimensional Monotonicity (DIM_2)</h2>
+<p>For a 2D parameter with knots $u_0, \dots, u_R$ (rows) and $v_0, \dots, v_C$ (columns), we define a grid of values $Z_{i,j}$.</p>
+<p>We want to enforce monotonicity in both dimensions. For example, "Increasing/Increasing" means:</p>
+<ul>
+<li>$Z_{i+1, j} \ge Z_{i, j}$ (Increasing in U)</li>
+<li>$Z_{i, j+1} \ge Z_{i, j}$ (Increasing in V)</li>
+</ul>
+<p>This is achieved using a parameterization similar to <strong>Isotonic Regression</strong> on a grid.</p>
+<h3>Parameterization</h3>
+<p>We define the grid values $Z_{i,j}$ using a set of non-negative parameters:</p>
+<ul>
+<li>$z_{00}$: Base value at origin (unbounded).</li>
+<li>$d^u_i$: Increments along the first column ($i=0 \dots R-2$).</li>
+<li>$d^v_j$: Increments along the first row ($j=0 \dots C-2$).</li>
+<li>$d^{int}_k$: Interaction increments for internal points.</li>
+</ul>
+<p>The reconstruction logic is:</p>
+<ol>
+<li>
+<p><strong>Origin</strong>:
+    $$ Z<em 00="00">{0,0} = z</em> $$</p>
+</li>
+<li>
+<p><strong>First Column (U-edge)</strong>:
+    $$ Z<em 0="0" i_="i,">{i+1, 0} = Z</em> + d^u_i, \quad d^u_i \ge 0 $$</p>
+</li>
+<li>
+<p><strong>First Row (V-edge)</strong>:
+    $$ Z<em 0_="0," j="j">{0, j+1} = Z</em> + d^v_j, \quad d^v_j \ge 0 $$</p>
+</li>
+<li>
+<p><strong>Internal Points</strong>:
+    For $i &gt; 0, j &gt; 0$, the value $Z_{i,j}$ must be greater than or equal to both its left neighbor $Z_{i, j-1}$ and its upper neighbor $Z_{i-1, j}$.</p>
+<p>$$ Z<em i-1_="i-1," j="j">{i, j} = \max(Z</em>, Z<em k="k">{i, j-1}) + d^{int}</em> \ge 0 $$}, \quad d^{int}_{k</p>
+</li>
+</ol>
+<p>This construction guarantees that every point is greater than or equal to its predecessors in both directions, ensuring global monotonicity on the grid.</p>
+<h3>Other Directions</h3>
+<p>For other monotonicity combinations (e.g., Increasing/Decreasing), the grid is flipped internally before applying the constraints, and then flipped back.</p>
+<ul>
+<li><strong>Inc/Dec</strong>: Flip V-axis, apply Inc/Inc, flip back.</li>
+<li><strong>Dec/Inc</strong>: Flip U-axis, apply Inc/Inc, flip back.</li>
+<li><strong>Dec/Dec</strong>: Flip both axes, apply Inc/Inc, flip back.</li>
+</ul>
+</body>
+</html>
