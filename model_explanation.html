@@ -9,6 +9,8 @@
         h1, h2, h3 { color: #333; }
         code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
         pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        /* Ensure math is visible */
+        .MathJax { font-size: 110%; }
     </style>
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
@@ -18,9 +20,9 @@
 <p>This document explains the mathematical formulation of the nonlinear fitting model and how monotonicity constraints are enforced for 1D and 2D parameters.</p>
 <h2>1. Model Overview</h2>
 <p>The model predicts a response variable $Y$ based on a set of risk factors (parameters). The relationship is modeled as:</p>
-<p>$$ Y = \exp\left( \sum_{k} f_k(X_k) \right) \cdot \epsilon $$</p>
+<p>$$ Y = \exp\left( \sum\_{k} f_k(X_k) \right) \cdot \epsilon $$</p>
 <p>Taking the logarithm, we get a linear additive model:</p>
-<p>$$ \ln(Y) = \sum_{k} f_k(X_k) + \ln(\epsilon) $$</p>
+<p>$$ \ln(Y) = \sum\_{k} f_k(X_k) + \ln(\epsilon) $$</p>
 <p>where $f_k(X_k)$ is the contribution of the $k$-th risk factor. The function $f_k$ can be:</p>
 <ul>
 <li><strong>DIM_0</strong>: A linear term $f(x) = \beta \cdot x$.</li>
@@ -31,13 +33,13 @@
 <p>For a 1D parameter with knots $k_0, k_1, \dots, k_n$, the function values at the knots are $v_0, v_1, \dots, v_n$. The function is interpolated linearly between knots.</p>
 <h3>Monotonic Increasing</h3>
 <p>To enforce that the function is monotonically increasing ($v_{i+1} \ge v_i$), we parameterize the values using non-negative increments (deltas):</p>
-<p>$$ v<em i-1="i-1">0 = P_0 $$
-$$ v_i = v</em> i=1 \dots n $$} + \delta_i \quad \text{for </p>
+<p>$$ v*0 = P_0 $$
+$$ v_i = v*{i-1} + \delta_i \quad \text{for } i=1 \dots n $$</p>
 <p>where $\delta_i \ge 0$.</p>
 <p>In the optimization, we solve for $P_0$ (unbounded) and $\delta_1, \dots, \delta_n$ (lower bound 0).</p>
 <h3>Monotonic Decreasing</h3>
 <p>Similarly, for monotonically decreasing functions:</p>
-<p>$$ v<em i-1="i-1">i = v</em> i=1 \dots n $$} - \delta_i \quad \text{for </p>
+<p>$$ v*i = v*{i-1} - \delta_i \quad \text{for } i=1 \dots n $$</p>
 <p>where $\delta_i \ge 0$.</p>
 <h2>3. Two-Dimensional Monotonicity (DIM_2)</h2>
 <p>For a 2D parameter with knots $u_0, \dots, u_R$ (rows) and $v_0, \dots, v_C$ (columns), we define a grid of values $Z_{i,j}$.</p>
@@ -59,20 +61,20 @@ $$ v_i = v</em> i=1 \dots n $$} + \delta_i \quad \text{for </p>
 <ol>
 <li>
 <p><strong>Origin</strong>:
-    $$ Z<em 00="00">{0,0} = z</em> $$</p>
+    $$ Z*{0,0} = z*{00} $$</p>
 </li>
 <li>
 <p><strong>First Column (U-edge)</strong>:
-    $$ Z<em 0="0" i_="i,">{i+1, 0} = Z</em> + d^u_i, \quad d^u_i \ge 0 $$</p>
+    $$ Z*{i+1, 0} = Z*{i, 0} + d^u_i, \quad d^u_i \ge 0 $$</p>
 </li>
 <li>
 <p><strong>First Row (V-edge)</strong>:
-    $$ Z<em 0_="0," j="j">{0, j+1} = Z</em> + d^v_j, \quad d^v_j \ge 0 $$</p>
+    $$ Z*{0, j+1} = Z*{0, j} + d^v_j, \quad d^v_j \ge 0 $$</p>
 </li>
 <li>
 <p><strong>Internal Points</strong>:
-    For $i &gt; 0, j &gt; 0$, the value $Z_{i,j}$ must be greater than or equal to both its left neighbor $Z_{i, j-1}$ and its upper neighbor $Z_{i-1, j}$.</p>
-<p>$$ Z<em i-1_="i-1," j="j">{i, j} = \max(Z</em>, Z<em k="k">{i, j-1}) + d^{int}</em> \ge 0 $$}, \quad d^{int}_{k</p>
+    For $i > 0, j > 0$, the value $Z_{i,j}$ must be greater than or equal to both its left neighbor $Z_{i, j-1}$ and its upper neighbor $Z_{i-1, j}$.</p>
+<p>$$ Z*{i, j} = \max(Z*{i-1, j}, Z*{i, j-1}) + d^{int}*{k}, \quad d^{int}\_{k} \ge 0 $$</p>
 </li>
 </ol>
 <p>This construction guarantees that every point is greater than or equal to its predecessors in both directions, ensuring global monotonicity on the grid.</p>

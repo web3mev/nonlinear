@@ -241,10 +241,48 @@ if 'params_df' in st.session_state:
         st.subheader("Performance Charts (Weighted Actual vs Model)")
         perf_figs = {k: v for k, v in figures.items() if k.startswith("Performance:")}
         if perf_figs:
-            cols = st.columns(4)
-            for i, (name, fig) in enumerate(perf_figs.items()):
-                with cols[i % 4]:
-                    st.pyplot(fig)
+            # Group by parameter name
+            grouped_figs = {}
+            for k, v in perf_figs.items():
+                # Extract param name. 
+                # Format: "Performance: {comp['name']} (By {comp['x1_var']})" or "Performance: {comp['name']}"
+                clean_k = k.replace("Performance: ", "")
+                if " (By " in clean_k:
+                    param_name = clean_k.split(" (By ")[0]
+                else:
+                    param_name = clean_k
+                
+                if param_name not in grouped_figs:
+                    grouped_figs[param_name] = []
+                grouped_figs[param_name].append((k, v))
+            
+            # Buffer for 1D plots
+            buffer_1d = []
+            
+            def flush_buffer_1d(buf):
+                if not buf: return
+                cols = st.columns(4)
+                for i, (name, fig) in enumerate(buf):
+                    with cols[i % 4]:
+                        st.pyplot(fig)
+                buf.clear()
+
+            for param_name, figs_list in grouped_figs.items():
+                if len(figs_list) == 2:
+                    # 2D Parameter - Flush buffer first
+                    flush_buffer_1d(buffer_1d)
+                    
+                    st.markdown(f"##### {param_name}")
+                    cols = st.columns(2)
+                    for i, (name, fig) in enumerate(figs_list):
+                        with cols[i]:
+                            st.pyplot(fig)
+                else:
+                    # 1D Parameter (or other count) - Add to buffer
+                    buffer_1d.extend(figs_list)
+            
+            # Final flush
+            flush_buffer_1d(buffer_1d)
         
         # Component Plots (Fitted Curves/Surfaces)
         st.subheader("Component Plots")
