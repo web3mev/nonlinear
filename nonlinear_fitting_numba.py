@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import numba
 import numexpr as ne
 import os
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Conditional imports
 try:
@@ -2154,137 +2157,10 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     figures['Actual vs Predicted'] = fig
     plt.close()
     
-    # Helper to calculate weighted averages using linear distribution to knots
-    def get_centered_weighted_stats(x_col, y_col, w_col, knots):
-        # Ensure knots are sorted and unique
-        sorted_knots = np.sort(np.unique(knots))
-        n_knots = len(sorted_knots)
-        
-        if n_knots == 0:
-            return pd.DataFrame({'x': [], 'y_mean': []})
-            
-        if n_knots == 1:
-            # Single knot: all weight goes to it
-            w_sum = w_col.sum()
-            y_weighted = (y_col * w_col).sum() / w_sum if w_sum > 0 else np.nan
-            return pd.DataFrame({'x': sorted_knots, 'y_mean': [y_weighted]})
-            
-        # Initialize accumulators for numerator (y*w) and denominator (w)
-        num = np.zeros(n_knots)
-        den = np.zeros(n_knots)
-        
-        x_data = data[x_col].to_numpy()
-        y_data = y_col.values if hasattr(y_col, 'values') else y_col
-        w_data = w_col.values if hasattr(w_col, 'values') else w_col
-        
-        # Find indices of the intervals
-        # idx[i] is such that knots[idx[i]-1] <= x_data[i] < knots[idx[i]]
-        # We want left knot index j such that knots[j] <= x < knots[j+1]
-        # np.searchsorted(side='right') gives index where x should be inserted to maintain order.
-        # If x is in [k_j, k_{j+1}), searchsorted returns j+1.
-        # So left knot index is idx - 1.
-        
-        idx = np.searchsorted(sorted_knots, x_data, side='right') - 1
-        
-        # Clip indices to valid range [0, n_knots-2] for interpolation
-        # Points < min(knots) go to first interval (extrapolation/clamping)
-        # Points >= max(knots) go to last interval
-        idx = np.clip(idx, 0, n_knots - 2)
-        
-        # Calculate weights
-        k_left = sorted_knots[idx]
-        k_right = sorted_knots[idx + 1]
-        
-        # Avoid division by zero if knots are identical (shouldn't happen due to unique)
-        span = k_right - k_left
-        # Fraction of distance from left knot. 
-        # If x < k_left, alpha < 0. If x > k_right, alpha > 1.
-        # We clamp alpha to [0, 1] so points outside range are assigned fully to nearest knot.
-        alpha = (x_data - k_left) / span
-        alpha = np.clip(alpha, 0.0, 1.0)
-        
-        w_right = alpha  # Weight for right knot
-        w_left = 1.0 - alpha # Weight for left knot
-        
-        # Accumulate weighted sums
-        # Left knot contributions
-        np.add.at(num, idx, w_left * w_data * y_data)
-        np.add.at(den, idx, w_left * w_data)
-        
-        # Right knot contributions
-        np.add.at(num, idx + 1, w_right * w_data * y_data)
-        np.add.at(den, idx + 1, w_right * w_data)
-        
-        # Calculate means
-        y_means = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
-        
-        return pd.DataFrame({'x': sorted_knots, 'y_mean': y_means})
+    # Helper functions moved to module level
+    # get_centered_weighted_stats
+    # get_centered_weighted_stats_2d
 
-    def get_centered_weighted_stats_2d(x1_col, x2_col, y_col, w_col, knots_x1, knots_x2):
-        # Sort knots
-        ks1 = np.sort(np.unique(knots_x1))
-        ks2 = np.sort(np.unique(knots_x2))
-        n1, n2 = len(ks1), len(ks2)
-        
-        # Initialize grid accumulators
-        num = np.zeros((n1, n2))
-        den = np.zeros((n1, n2))
-        
-        x1_data = data[x1_col].to_numpy()
-        x2_data = data[x2_col].to_numpy()
-        y_data = y_col.values if hasattr(y_col, 'values') else y_col
-        w_data = w_col.values if hasattr(w_col, 'values') else w_col
-        
-        # 1. Find intervals for X1
-        if n1 > 1:
-            idx1 = np.searchsorted(ks1, x1_data, side='right') - 1
-            idx1 = np.clip(idx1, 0, n1 - 2)
-            span1 = ks1[idx1 + 1] - ks1[idx1]
-            alpha1 = np.clip((x1_data - ks1[idx1]) / span1, 0.0, 1.0)
-            w1_right = alpha1
-            w1_left = 1.0 - alpha1
-        else:
-            idx1 = np.zeros(len(x1_data), dtype=int)
-            w1_left = np.ones(len(x1_data))
-            w1_right = np.zeros(len(x1_data)) # No right neighbor
-            
-        # 2. Find intervals for X2
-        if n2 > 1:
-            idx2 = np.searchsorted(ks2, x2_data, side='right') - 1
-            idx2 = np.clip(idx2, 0, n2 - 2)
-            span2 = ks2[idx2 + 1] - ks2[idx2]
-            alpha2 = np.clip((x2_data - ks2[idx2]) / span2, 0.0, 1.0)
-            w2_right = alpha2
-            w2_left = 1.0 - alpha2
-        else:
-            idx2 = np.zeros(len(x2_data), dtype=int)
-            w2_left = np.ones(len(x2_data))
-            w2_right = np.zeros(len(x2_data))
-            
-        # 3. Accumulate to 4 corners (Bilinear interpolation weights)
-        # Corner (i, j): w1_left * w2_left
-        np.add.at(num, (idx1, idx2), w1_left * w2_left * w_data * y_data)
-        np.add.at(den, (idx1, idx2), w1_left * w2_left * w_data)
-        
-        if n1 > 1:
-            # Corner (i+1, j): w1_right * w2_left
-            np.add.at(num, (idx1 + 1, idx2), w1_right * w2_left * w_data * y_data)
-            np.add.at(den, (idx1 + 1, idx2), w1_right * w2_left * w_data)
-            
-        if n2 > 1:
-            # Corner (i, j+1): w1_left * w2_right
-            np.add.at(num, (idx1, idx2 + 1), w1_left * w2_right * w_data * y_data)
-            np.add.at(den, (idx1, idx2 + 1), w1_left * w2_right * w_data)
-            
-        if n1 > 1 and n2 > 1:
-            # Corner (i+1, j+1): w1_right * w2_right
-            np.add.at(num, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data * y_data)
-            np.add.at(den, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data)
-            
-        grid = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
-        return grid
-
-    # Get balance for weighting
     # Get balance for weighting
     if 'balance' in data.columns:
         weights = data['balance'].to_numpy()
@@ -2305,11 +2181,11 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             fig_perf, ax = plt.subplots(figsize=(10, 6))
             
             # Plot Weighted Actuals
-            stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'])
+            stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'], data)
             ax.plot(stats_act['x'], stats_act['y_mean'], 'rs--', label='Weighted Actual', alpha=0.7)
             
             # Plot Weighted Model
-            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'])
+            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'], data)
             ax.plot(stats_mod['x'], stats_mod['y_mean'], 'gs--', label='Weighted Model', alpha=0.7)
             
             # Count bins with data
@@ -2343,10 +2219,10 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             # --- Performance Charts (Slices) ---
             # Calculate Weighted Actual and Model Grids
             grid_actual = get_centered_weighted_stats_2d(
-                comp['x1_var'], comp['x2_var'], y_true, weights, comp['knots_x1'], comp['knots_x2']
+                comp['x1_var'], comp['x2_var'], y_true, weights, comp['knots_x1'], comp['knots_x2'], data
             )
             grid_model = get_centered_weighted_stats_2d(
-                comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2']
+                comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2'], data
             )
             
             # Helper to create subplot grid
@@ -2480,7 +2356,7 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     
     return figures
 
-def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback=None, backend='scipy_ls', method='trf', options=None, stop_event=None):
+def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback=None, backend='scipy_ls', method='trf', options=None, stop_event=None, plotting_backend='matplotlib'):
     """
     API version of run_fitting for GUI.
     """
@@ -2623,6 +2499,9 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
             # Legacy placeholder, redirect to poisson_cupy if possible or just warn
             print("Legacy 'cupy' backend selected. Using 'poisson_cupy' instead.")
             res = fit_poisson_cupy(x_current, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, options=options, stop_event=stop_event)
+            
+        elif backend in ['differential_evolution', 'basinhopping']:
+            res = fit_global_optimization(x_current, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, method=backend, options=options, stop_event=stop_event)
         
         # Check if this run is better
         if res and res.success:
@@ -2690,7 +2569,10 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     
     if progress_callback: progress_callback(0.95, "Generating plots...")
     # Pass computed y_pred and residuals to avoid re-computation
-    figures = plot_fitting_results_gui(P_final, components, df_data, y_true_arr, true_values, y_pred=y_pred, residuals=residuals)
+    if plotting_backend == 'plotly':
+        figures = plot_fitting_results_plotly(P_final, components, df_data, y_true_arr, true_values, y_pred=y_pred, residuals=residuals)
+    else:
+        figures = plot_fitting_results_gui(P_final, components, df_data, y_true_arr, true_values, y_pred=y_pred, residuals=residuals)
     
     if progress_callback: progress_callback(1.0, "Done!")
     
@@ -2700,6 +2582,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         'time': elapsed,
         'metrics': metrics,
         'fitted_params': df_results,
+        'P_final': P_final,
         'figures': figures,
         'data': df_data, # Return data in case we want to reuse it
         'true_values': true_values,
@@ -2846,3 +2729,668 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
     }
     
     return report_str, metrics
+
+# --- Helper Functions for Plotting ---
+def get_centered_weighted_stats(x_col, y_col, w_col, knots, data):
+    # Ensure knots are sorted and unique
+    sorted_knots = np.sort(np.unique(knots))
+    n_knots = len(sorted_knots)
+    
+    if n_knots == 0:
+        return pd.DataFrame({'x': [], 'y_mean': []})
+        
+    if n_knots == 1:
+        # Single knot: all weight goes to it
+        w_sum = w_col.sum()
+        y_weighted = (y_col * w_col).sum() / w_sum if w_sum > 0 else np.nan
+        return pd.DataFrame({'x': sorted_knots, 'y_mean': [y_weighted]})
+        
+    # Initialize accumulators for numerator (y*w) and denominator (w)
+    num = np.zeros(n_knots)
+    den = np.zeros(n_knots)
+    
+    x_data = data[x_col].to_numpy()
+    y_data = y_col.values if hasattr(y_col, 'values') else y_col
+    w_data = w_col.values if hasattr(w_col, 'values') else w_col
+    
+    # Find indices of the intervals
+    idx = np.searchsorted(sorted_knots, x_data, side='right') - 1
+    
+    # Clip indices to valid range [0, n_knots-2] for interpolation
+    idx = np.clip(idx, 0, n_knots - 2)
+    
+    # Calculate weights
+    k_left = sorted_knots[idx]
+    k_right = sorted_knots[idx + 1]
+    
+    # Avoid division by zero if knots are identical (shouldn't happen due to unique)
+    span = k_right - k_left
+    alpha = (x_data - k_left) / span
+    alpha = np.clip(alpha, 0.0, 1.0)
+    
+    w_right = alpha  # Weight for right knot
+    w_left = 1.0 - alpha # Weight for left knot
+    
+    # Accumulate weighted sums
+    np.add.at(num, idx, w_left * w_data * y_data)
+    np.add.at(den, idx, w_left * w_data)
+    
+    np.add.at(num, idx + 1, w_right * w_data * y_data)
+    np.add.at(den, idx + 1, w_right * w_data)
+    
+    # Calculate means
+    y_means = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+    
+    return pd.DataFrame({'x': sorted_knots, 'y_mean': y_means})
+
+def get_centered_weighted_stats_2d(x1_col, x2_col, y_col, w_col, knots_x1, knots_x2, data):
+    # Sort knots
+    ks1 = np.sort(np.unique(knots_x1))
+    ks2 = np.sort(np.unique(knots_x2))
+    n1, n2 = len(ks1), len(ks2)
+    
+    # Initialize grid accumulators
+    num = np.zeros((n1, n2))
+    den = np.zeros((n1, n2))
+    
+    x1_data = data[x1_col].to_numpy()
+    x2_data = data[x2_col].to_numpy()
+    y_data = y_col.values if hasattr(y_col, 'values') else y_col
+    w_data = w_col.values if hasattr(w_col, 'values') else w_col
+    
+    # 1. Find intervals for X1
+    if n1 > 1:
+        idx1 = np.searchsorted(ks1, x1_data, side='right') - 1
+        idx1 = np.clip(idx1, 0, n1 - 2)
+        span1 = ks1[idx1 + 1] - ks1[idx1]
+        alpha1 = np.clip((x1_data - ks1[idx1]) / span1, 0.0, 1.0)
+        w1_right = alpha1
+        w1_left = 1.0 - alpha1
+    else:
+        idx1 = np.zeros(len(x1_data), dtype=int)
+        w1_left = np.ones(len(x1_data))
+        w1_right = np.zeros(len(x1_data)) # No right neighbor
+        
+    # 2. Find intervals for X2
+    if n2 > 1:
+        idx2 = np.searchsorted(ks2, x2_data, side='right') - 1
+        idx2 = np.clip(idx2, 0, n2 - 2)
+        span2 = ks2[idx2 + 1] - ks2[idx2]
+        alpha2 = np.clip((x2_data - ks2[idx2]) / span2, 0.0, 1.0)
+        w2_right = alpha2
+        w2_left = 1.0 - alpha2
+    else:
+        idx2 = np.zeros(len(x2_data), dtype=int)
+        w2_left = np.ones(len(x2_data))
+        w2_right = np.zeros(len(x2_data))
+        
+    # 3. Accumulate to 4 corners (Bilinear interpolation weights)
+    np.add.at(num, (idx1, idx2), w1_left * w2_left * w_data * y_data)
+    np.add.at(den, (idx1, idx2), w1_left * w2_left * w_data)
+    
+    if n1 > 1:
+        np.add.at(num, (idx1 + 1, idx2), w1_right * w2_left * w_data * y_data)
+        np.add.at(den, (idx1 + 1, idx2), w1_right * w2_left * w_data)
+        
+    if n2 > 1:
+        np.add.at(num, (idx1, idx2 + 1), w1_left * w2_right * w_data * y_data)
+        np.add.at(den, (idx1, idx2 + 1), w1_left * w2_right * w_data)
+        
+    if n1 > 1 and n2 > 1:
+        np.add.at(num, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data * y_data)
+        np.add.at(den, (idx1 + 1, idx2 + 1), w1_right * w2_right * w_data)
+        
+    grid = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+    return grid
+
+def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred=None, residuals=None):
+    """
+    Generates interactive Plotly figures for fitting results.
+    """
+    figures = {}
+    
+    # If y_pred is not provided, compute it (fallback)
+    if y_pred is None:
+        A = precompute_basis(components, data)
+        y_log = A @ P
+        y_pred = np.exp(y_log)
+        
+    if residuals is None:
+        residuals = y_true - y_pred
+    
+    # Downsample for scatter plots if too large
+    n_points = len(y_true)
+    if n_points > 5000:
+        indices = np.random.choice(n_points, 5000, replace=False)
+        y_true_plot = y_true[indices] if isinstance(y_true, np.ndarray) else y_true.iloc[indices]
+        y_pred_plot = y_pred[indices]
+        res_plot = residuals[indices] if isinstance(residuals, np.ndarray) else residuals.iloc[indices]
+    else:
+        y_true_plot = y_true
+        y_pred_plot = y_pred
+        res_plot = residuals
+
+    # 1. Actual vs Predicted
+    fig = px.scatter(x=y_true_plot, y=y_pred_plot, opacity=0.3, 
+                     labels={'x': 'True Y', 'y': 'Predicted Y'},
+                     title=f'Actual vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    # Add identity line
+    min_val = min(y_true_plot.min(), y_pred_plot.min())
+    max_val = max(y_true_plot.max(), y_pred_plot.max())
+    fig.add_shape(type="line", x0=min_val, y0=min_val, x1=max_val, y1=max_val,
+                  line=dict(color="Red", dash="dash"))
+    figures['Actual vs Predicted'] = fig
+    
+    # 2. Residuals vs Predicted
+    fig = px.scatter(x=y_pred_plot, y=res_plot, opacity=0.3,
+                     labels={'x': 'Predicted Y', 'y': 'Residuals'},
+                     title=f'Residuals vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    fig.add_hline(y=0, line_dash="dash", line_color="red")
+    figures['Residuals vs Predicted'] = fig
+    
+    # 3. Histogram of Residuals
+    fig = px.histogram(res_plot, nbins=50, title='Histogram of Residuals', labels={'value': 'Residual'})
+    figures['Histogram of Residuals'] = fig
+    
+    # 4. Q-Q Plot (Manual construction for Plotly)
+    # Sort residuals
+    res_sorted = np.sort(res_plot)
+    # Theoretical quantiles (Normal)
+    from scipy import stats
+    osm, osr = stats.probplot(res_sorted, dist="norm", fit=False)
+    fig = px.scatter(x=osm, y=osr, labels={'x': 'Theoretical Quantiles', 'y': 'Ordered Values'},
+                     title='Q-Q Plot')
+    # Add fit line
+    slope, intercept, r, p, stderr = stats.linregress(osm, osr)
+    line_x = np.array([osm.min(), osm.max()])
+    line_y = slope * line_x + intercept
+    fig.add_trace(go.Scatter(x=line_x, y=line_y, mode='lines', name='Fit', line=dict(color='red')))
+    figures['Q-Q Plot'] = fig
+    
+    # Get balance for weighting
+    if 'balance' in data.columns:
+        weights = data['balance'].to_numpy()
+    else:
+        weights = np.ones(len(data))
+
+    curr_idx = 0
+    for i, comp in enumerate(components):
+        n = comp['n_params']
+        vals = P[curr_idx : curr_idx + n]
+        curr_idx += n
+        
+        t_vals = true_values[i] if true_values is not None else None
+        
+        if comp['type'] == 'DIM_1':
+            # --- Performance Chart ---
+            stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'], data)
+            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'], data)
+            
+            fig_perf = go.Figure()
+            fig_perf.add_trace(go.Scatter(x=stats_act['x'], y=stats_act['y_mean'], mode='lines+markers', name='Weighted Actual', line=dict(color='red', dash='dash')))
+            fig_perf.add_trace(go.Scatter(x=stats_mod['x'], y=stats_mod['y_mean'], mode='lines+markers', name='Weighted Model', line=dict(color='green', dash='dash')))
+            
+            # Count bins with data
+            n_bins_with_data = stats_act['y_mean'].notna().sum()
+            fig_perf.update_layout(title=f"Performance: {comp['name']} ({len(comp['knots'])} knots, {n_bins_with_data} bins with data)",
+                                   xaxis_title=comp['x1_var'], yaxis_title='Response')
+            figures[f"Performance: {comp['name']}"] = fig_perf
+            
+            # --- Component Plot ---
+            fig_comp = go.Figure()
+            fig_comp.add_trace(go.Scatter(x=comp['knots'], y=vals, mode='lines+markers', name='Fitted', line=dict(color='red')))
+            if t_vals is not None:
+                fig_comp.add_trace(go.Scatter(x=comp['knots'], y=t_vals, mode='lines', name='True', line=dict(color='green', dash='dash')))
+                
+            # Interpolated line
+            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
+            y_grid = np.interp(x_grid, comp['knots'], vals)
+            fig_comp.add_trace(go.Scatter(x=x_grid, y=y_grid, mode='lines', name='Fitted (Interp)', line=dict(color='blue', width=1), opacity=0.5))
+            
+            fig_comp.update_layout(title=f"Component: {comp['name']}", xaxis_title=comp['x1_var'], yaxis_title='Value')
+            figures[f"Component: {comp['name']}"] = fig_comp
+            
+        elif comp['type'] == 'DIM_2':
+            # --- Performance Charts (Slices) ---
+            grid_actual = get_centered_weighted_stats_2d(
+                comp['x1_var'], comp['x2_var'], y_true, weights, comp['knots_x1'], comp['knots_x2'], data
+            )
+            grid_model = get_centered_weighted_stats_2d(
+                comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2'], data
+            )
+            
+            # Helper for slices
+            def create_slice_grid_plotly(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis):
+                n_slices = len(slice_knots)
+                n_cols = 3
+                n_rows = int(np.ceil(n_slices / n_cols))
+                
+                fig = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=[f"{slices_dim_name}={k:.4g}" for k in slice_knots])
+                
+                for i in range(n_slices):
+                    slice_val = slice_knots[i]
+                    row = (i // n_cols) + 1
+                    col = (i % n_cols) + 1
+                    
+                    if slice_axis == 0: # Slicing X1 (rows)
+                        y_act = grid_act[i, :]
+                        y_mod = grid_mod[i, :]
+                    else: # Slicing X2 (cols)
+                        y_act = grid_act[:, i]
+                        y_mod = grid_mod[:, i]
+                        
+                    fig.add_trace(go.Scatter(x=x_knots, y=y_act, mode='lines+markers', name='Weighted Actual', line=dict(color='red', dash='dash'), showlegend=(i==0)), row=row, col=col)
+                    fig.add_trace(go.Scatter(x=x_knots, y=y_mod, mode='lines+markers', name='Weighted Model', line=dict(color='green', dash='dash'), showlegend=(i==0)), row=row, col=col)
+                    
+                fig.update_layout(height=300*n_rows, title=f"Performance: {comp['name']} (By {slices_dim_name})")
+                return fig
+
+            # 1. Slices along X2 (Fixed X1)
+            fig1 = create_slice_grid_plotly(comp['x1_var'], comp['x2_var'], comp['knots_x2'], comp['knots_x1'], grid_actual, grid_model, 0)
+            figures[f"Performance: {comp['name']} (By {comp['x1_var']})"] = fig1
+            
+            # 2. Slices along X1 (Fixed X2)
+            fig2 = create_slice_grid_plotly(comp['x2_var'], comp['x1_var'], comp['knots_x1'], comp['knots_x2'], grid_actual, grid_model, 1)
+            figures[f"Performance: {comp['name']} (By {comp['x2_var']})"] = fig2
+            
+            # --- Component Heatmap ---
+            grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            
+            if t_vals is not None:
+                fig_hm = make_subplots(rows=1, cols=2, subplot_titles=("Fitted", "True"))
+                t_grid = t_vals.reshape(comp['n_rows'], comp['n_cols'])
+                
+                fig_hm.add_trace(go.Heatmap(z=grid, x=comp['knots_x2'], y=comp['knots_x1'], colorscale='Viridis'), row=1, col=1)
+                fig_hm.add_trace(go.Heatmap(z=t_grid, x=comp['knots_x2'], y=comp['knots_x1'], colorscale='Viridis'), row=1, col=2)
+            else:
+                fig_hm = go.Figure(data=go.Heatmap(z=grid, x=comp['knots_x2'], y=comp['knots_x1'], colorscale='Viridis'))
+                fig_hm.update_layout(title=f"Component: {comp['name']} (Fitted)")
+                
+            figures[f"Component: {comp['name']}"] = fig_hm
+    
+    return figures
+
+# --- Bootstrapping ---
+def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', options=None):
+    """
+    Runs bootstrapping to estimate parameter uncertainty.
+    """
+    print(f"Running Bootstrap with {n_boot} iterations...")
+    
+    # 1. Fit original model to get base parameters
+    # We assume run_fitting_api returns the result dict
+    # But we need to call it without threading or callbacks here, or just reuse logic.
+    # Reusing run_fitting_api might be circular or heavy if it does too much UI stuff.
+    # Let's use the core fitting logic.
+    
+    components = load_model_spec(df=df_params)
+    A = precompute_basis(components, df_data)
+    
+    # Pack parameters
+    pack_mode = 'transform'
+    if backend in ['scipy_min', 'nlopt']:
+        pack_mode = 'direct'
+    elif backend in ['linearized_ls', 'poisson_lbfgsb', 'poisson_cupy']:
+        pack_mode = 'transform'
+        
+    x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
+    
+    y_true_arr = df_data['y'].to_numpy()
+    w_arr = df_data['w'].to_numpy()
+    n_samples = len(y_true_arr)
+    
+    # Store bootstrap results
+    boot_results = []
+    
+    # Parallelization? Numba releases GIL, but we are calling scipy/python.
+    # joblib might be good here, but let's keep it simple sequential or simple ThreadPool for now.
+    # Bootstrapping is embarrassingly parallel.
+    
+    import concurrent.futures
+    
+    def single_boot(i):
+        # Resample indices
+        indices = np.random.choice(n_samples, n_samples, replace=True)
+        
+        # Resampled data
+        # We need to slice A as well. A is sparse CSR.
+        # Slicing CSR with array indices is supported but can be slow.
+        # A[indices]
+        A_boot = A[indices]
+        y_boot = y_true_arr[indices]
+        w_boot = w_arr[indices]
+        
+        # Perturb x0 slightly? Or use original x0.
+        x_curr = x0.copy()
+        
+        # Run fit
+        # We need to call the specific backend fit function
+        res = None
+        try:
+            if backend == 'scipy_ls':
+                # Simplified call
+                alpha = options.get('l1_reg', 0.0) + options.get('l2_reg', 0.0)
+                l1_ratio = options.get('l1_reg', 0.0) / alpha if alpha > 0 else 0.0
+                
+                res = scipy.optimize.least_squares(
+                    residual_func_fast,
+                    x_curr,
+                    jac=jacobian_func_fast,
+                    bounds=bounds,
+                    args=(A_boot, param_mapping, base_P, y_boot, w_boot, alpha, l1_ratio),
+                    verbose=0,
+                    method=method,
+                    x_scale='jac'
+                )
+            elif backend == 'linearized_ls':
+                 res = fit_linearized_ls(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, bounds, param_mapping_numba)
+            # ... Add other backends if needed ...
+            else:
+                # Fallback or not supported yet for bootstrap
+                return None
+                
+            if res and res.success:
+                return res.x
+        except Exception as e:
+            return None
+        return None
+
+    # Run in parallel
+    # Use ThreadPoolExecutor because we might be IO bound or GIL bound but numpy releases GIL often.
+    # ProcessPoolExecutor is safer for CPU bound but requires pickling everything.
+    # Let's try ThreadPool first.
+    
+    valid_boots = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [executor.submit(single_boot, i) for i in range(n_boot)]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res is not None:
+                valid_boots.append(res)
+                
+    if not valid_boots:
+        print("Bootstrap failed: No valid runs.")
+        return None
+        
+    boot_array = np.array(valid_boots)
+    
+    # Calculate Percentiles
+    # We want to map these back to P (fitted values)
+    # But P is derived from x.
+    # We can return the array of x and let the caller handle P reconstruction statistics.
+    
+    return boot_array
+
+# --- Global Optimization Wrappers ---
+def fit_global_optimization(x0, A, param_mapping, base_P, y_true, w, components, bounds, param_mapping_numba, method='differential_evolution', options=None, stop_event=None):
+    print(f"Running Global Optimization ({method})...")
+    
+    # Unpack Numba mapping
+    (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
+    
+    l1_reg = options.get('l1_reg', 0.0) if options else 0.0
+    l2_reg = options.get('l2_reg', 0.0) if options else 0.0
+    
+    # Objective Function (Least Squares)
+    def objective(x):
+        if stop_event and stop_event.is_set():
+            # Global optimizers might not handle exceptions gracefully, but let's try
+            raise InterruptedError("Fitting stopped by user.")
+            
+        P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+        y_log = A @ P
+        y_pred = np.exp(y_log)
+        res = (y_true - y_pred) / w
+        val = 0.5 * np.sum(res**2)
+        
+        if l2_reg > 0: val += 0.5 * l2_reg * np.sum(x**2)
+        if l1_reg > 0: val += l1_reg * np.sum(np.abs(x))
+        return val
+
+    # Bounds
+    # differential_evolution requires bounds list of (min, max)
+    # basin_hopping doesn't strictly require them but can use them with a local minimizer.
+    bnds = list(zip(bounds[0], bounds[1]))
+    
+    # Replace -inf/inf with large numbers for DE
+    de_bounds = []
+    for lb, ub in bnds:
+        l = lb if np.isfinite(lb) else -10.0 # Arbitrary large range if unbounded
+        u = ub if np.isfinite(ub) else 10.0
+        de_bounds.append((l, u))
+        
+    res = None
+    if method == 'differential_evolution':
+        res = scipy.optimize.differential_evolution(
+            objective,
+            bounds=de_bounds,
+            maxiter=options.get('maxiter', 100),
+            popsize=10,
+            disp=True,
+            workers=-1 # Parallel
+        )
+    elif method == 'basinhopping':
+        # Basin hopping needs a local minimizer
+        minimizer_kwargs = {"method": "L-BFGS-B", "bounds": bnds}
+        res = scipy.optimize.basinhopping(
+            objective,
+            x0,
+            niter=options.get('maxiter', 100),
+            minimizer_kwargs=minimizer_kwargs,
+            disp=True
+        )
+        
+    # Standardize result
+    if res:
+        # Calculate cost if missing
+        if not hasattr(res, 'cost'):
+            res.cost = res.fun
+            
+    return res
+
+# --- Serialization ---
+import pickle
+
+def save_model(filepath, components, P_final, metrics, report_str):
+    """
+    Saves the fitted model to a file.
+    """
+    model_data = {
+        'components': components,
+        'P_final': P_final,
+        'metrics': metrics,
+        'report': report_str
+    }
+    with open(filepath, 'wb') as f:
+        pickle.dump(model_data, f)
+    print(f"Model saved to {filepath}")
+
+def load_model(filepath):
+    """
+    Loads a fitted model from a file.
+    """
+    with open(filepath, 'rb') as f:
+        model_data = pickle.load(f)
+    return model_data
+
+# --- Cross-Validation ---
+from sklearn.model_selection import KFold
+
+def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy_ls', method='trf'):
+    """
+    Runs k-fold cross-validation to tune hyperparameters (L1/L2 reg).
+    param_grid: list of dicts, e.g. [{'l1_reg': 0.1, 'l2_reg': 0.0}, ...]
+    """
+    print(f"Running {k_folds}-fold Cross-Validation with {len(param_grid)} parameter sets...")
+    
+    y_true = df_data['y'].to_numpy()
+    w = df_data['w'].to_numpy()
+    n_samples = len(y_true)
+    
+    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    
+    results = []
+    
+    # Precompute basis once if possible?
+    # Basis depends on data. If we split data, we split basis rows.
+    components = load_model_spec(df=df_params)
+    A_full = precompute_basis(components, df_data)
+    
+    # Pack parameters once
+    pack_mode = 'transform'
+    if backend in ['scipy_min', 'nlopt', 'differential_evolution', 'basinhopping']:
+        pack_mode = 'direct'
+    
+    x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
+    
+    for params in param_grid:
+        l1 = params.get('l1_reg', 0.0)
+        l2 = params.get('l2_reg', 0.0)
+        
+        fold_scores = []
+        
+        for train_index, test_index in kf.split(A_full):
+            # Train data
+            A_train = A_full[train_index]
+            y_train = y_true[train_index]
+            w_train = w[train_index]
+            
+            # Test data
+            A_test = A_full[test_index]
+            y_test = y_true[test_index]
+            w_test = w[test_index]
+            
+            # Fit on Train
+            # We need to call a fit function that takes A directly.
+            # fit_scipy_minimize or similar takes A.
+            # But run_fitting_api wraps it.
+            # Let's use the backend specific function directly.
+            
+            x_opt = None
+            try:
+                if backend == 'scipy_ls':
+                    alpha = l1 + l2
+                    l1_ratio = l1 / alpha if alpha > 0 else 0.0
+                    res = scipy.optimize.least_squares(
+                        residual_func_fast,
+                        x0,
+                        jac=jacobian_func_fast,
+                        bounds=bounds,
+                        args=(A_train, param_mapping, base_P, y_train, w_train, alpha, l1_ratio),
+                        verbose=0,
+                        method=method,
+                        x_scale='jac'
+                    )
+                    if res.success: x_opt = res.x
+                # ... Add other backends ...
+                else:
+                    # Fallback to scipy_ls for CV for now as it's standard
+                    # Or implement others.
+                    pass
+            except:
+                pass
+                
+            if x_opt is not None:
+                # Evaluate on Test
+                P_test = reconstruct_P(x_opt, param_mapping, base_P)
+                y_log_test = A_test @ P_test
+                y_pred_test = np.exp(y_log_test)
+                
+                # Metric: RMSE or Weighted RMSE
+                res_test = (y_test - y_pred_test)
+                rmse = np.sqrt(np.mean(res_test**2))
+                fold_scores.append(rmse)
+            else:
+                fold_scores.append(np.nan)
+                
+        avg_score = np.nanmean(fold_scores)
+        results.append({**params, 'score': avg_score})
+        print(f"Params: {params}, Score: {avg_score}")
+        
+    return pd.DataFrame(results).sort_values('score')
+
+# --- MCMC (Bayesian Inference) ---
+import emcee
+import corner
+
+def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method='trf', options=None):
+    """
+    Runs MCMC using emcee to sample from the posterior distribution.
+    """
+    print(f"Running MCMC with {n_walkers} walkers for {n_steps} steps...")
+    
+    y_true = df_data['y'].to_numpy()
+    w = df_data['w'].to_numpy()
+    
+    components = load_model_spec(df=df_params)
+    A = precompute_basis(components, df_data)
+    
+    # Pack parameters
+    pack_mode = 'transform' # Use transform mode to handle monotonicity via unconstrained space
+    if backend in ['scipy_min', 'nlopt', 'differential_evolution', 'basinhopping']:
+        pack_mode = 'direct'
+        
+    x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
+    
+    ndim = len(x0)
+    
+    # Unpack Numba mapping
+    (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
+    
+    # Log Prior
+    def log_prior(theta):
+        # Check bounds
+        # bounds is (lb, ub)
+        # If any theta is outside bounds, return -inf
+        if bounds:
+            lb, ub = bounds
+            if np.any(theta < lb) or np.any(theta > ub):
+                return -np.inf
+        return 0.0
+
+    # Log Likelihood
+    def log_likelihood(theta):
+        # Reconstruct P
+        # We need to use the numba version for speed, but emcee calls this from python.
+        # reconstruct_P_numba is jitted, so it's fast.
+        P = reconstruct_P_numba(theta, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+        y_log = A @ P
+        y_pred = np.exp(y_log)
+        
+        # Gaussian likelihood
+        # sigma = 1/sqrt(w) -> w = 1/sigma^2
+        # log L = -0.5 * sum( (y - y_pred)^2 * w )
+        # Ignoring constant terms
+        res = (y_true - y_pred)
+        ll = -0.5 * np.sum(res**2 * w)
+        return ll
+
+    # Log Probability
+    def log_probability(theta):
+        lp = log_prior(theta)
+        if not np.isfinite(lp):
+            return -np.inf
+        return lp + log_likelihood(theta)
+
+    # Initialize walkers
+    # Start around x0 with small perturbation
+    pos = x0 + 1e-4 * np.random.randn(n_walkers, ndim)
+    
+    # Check if pos is within bounds
+    if bounds:
+        lb, ub = bounds
+        # Clip to bounds
+        pos = np.clip(pos, lb + 1e-5, ub - 1e-5)
+        
+    # Run MCMC
+    sampler = emcee.EnsembleSampler(n_walkers, ndim, log_probability)
+    
+    # Run
+    sampler.run_mcmc(pos, n_steps, progress=True)
+    
+    # Get samples
+    # Discard burn-in (e.g. first 20%)
+    discard = int(n_steps * 0.2)
+    flat_samples = sampler.get_chain(discard=discard, flat=True)
+    
+    return flat_samples

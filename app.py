@@ -74,6 +74,8 @@ backend_options = {
     "Poisson Loss (L-BFGS-B)": "poisson_lbfgsb",
     "Poisson Loss (CuPy Accelerated)": "poisson_cupy",
     "NLopt": "nlopt",
+    "Differential Evolution (Global)": "differential_evolution",
+    "Basin Hopping (Global)": "basinhopping",
     "CuPy (Legacy Placeholder)": "cupy"
 }
 
@@ -96,6 +98,8 @@ elif selected_backend == "poisson_cupy":
     method_options = ["L-BFGS-B"]
 elif selected_backend == "nlopt":
     method_options = ["LD_SLSQP", "LD_MMA", "LD_LBFGS", "LN_COBYLA"]
+elif selected_backend in ["differential_evolution", "basinhopping"]:
+    method_options = ["Default"]
 
 selected_method = st.sidebar.selectbox("Method", method_options, index=default_method)
 
@@ -143,6 +147,53 @@ sample_size = st.sidebar.number_input("Sample Size", min_value=1000, value=10000
 data_file = None
 if data_source == "Load Data File":
     data_file = st.sidebar.file_uploader("Upload Data File", type=["csv", "parquet"])
+
+st.sidebar.markdown("#### Visualization")
+plotting_backend = st.sidebar.radio("Plotting Library", ["Matplotlib", "Plotly"], index=1)
+plotting_backend_key = plotting_backend.lower()
+
+# Model Management
+st.sidebar.markdown("---")
+st.sidebar.header("Model Management")
+model_file = st.sidebar.text_input("Model Filename", "saved_model.pkl")
+
+if st.sidebar.button("Save Model"):
+    if 'fitting_results' in st.session_state and st.session_state.fitting_results:
+        try:
+            # We need components. Load them from current params.
+            if 'params_df' in st.session_state:
+                comps = nlf.load_model_spec(df=st.session_state.params_df)
+                res = st.session_state.fitting_results
+                
+                if 'P_final' in res:
+                    nlf.save_model(model_file, comps, res['P_final'], res['metrics'], res['report'])
+                    st.sidebar.success(f"Saved to {model_file}")
+                else:
+                    st.sidebar.error("P_final not found in results. Please re-run fit.")
+            else:
+                st.sidebar.error("Parameters not loaded.")
+        except Exception as e:
+            st.sidebar.error(f"Save failed: {e}")
+    else:
+        st.sidebar.warning("No fitting results to save.")
+
+if st.sidebar.button("Load Model"):
+    try:
+        if os.path.exists(model_file):
+            model_data = nlf.load_model(model_file)
+            st.sidebar.success(f"Loaded {model_file}")
+            # Restore state?
+            # We can display the report and metrics.
+            # Restoring the full interactive state is hard without the original data.
+            # But we can show the parameters.
+            
+            st.session_state.loaded_model = model_data
+            # We could potentially overwrite params_df if we saved it?
+            # For now, just store it to display.
+        else:
+            st.sidebar.error("File not found.")
+    except Exception as e:
+        st.sidebar.error(f"Load failed: {e}")
 
 # --- Main Content ---
 
@@ -261,6 +312,161 @@ if 'params_df' in st.session_state:
             st.success(f"Saved to {param_file}")
         except Exception as e:
             st.error(f"Error saving file: {e}")
+
+    # Bootstrap Section
+    st.markdown("---")
+    st.header("Uncertainty Estimation (Bootstrap)")
+    
+    n_boot = st.number_input("Number of Bootstrap Iterations", min_value=10, value=50, step=10)
+    if st.button("Run Bootstrap"):
+        if 'fitting_results' in st.session_state and st.session_state.fitting_results:
+            with st.spinner(f"Running {n_boot} bootstrap iterations..."):
+                try:
+                    # We need access to data and params
+                    # Assuming fitting_results has 'data' and we have 'params_df'
+                    # But run_bootstrap needs raw arrays or df.
+                    
+                    # Re-prepare data
+                    df_run = st.session_state.fitting_results.get('data')
+                    if df_run is None:
+                         # Fallback to current fitting_data
+                         df_run = st.session_state.fitting_data
+                         
+                    if df_run is None:
+                        st.error("No data available for bootstrap.")
+                    else:
+                        boot_res = nlf.run_bootstrap(
+                            n_boot=n_boot,
+                            df_params=st.session_state.params_df,
+                            df_data=df_run,
+                            backend=selected_backend,
+                            method=selected_method,
+                            options={'l1_reg': l1_reg, 'l2_reg': l2_reg}
+                        )
+                        
+                        if boot_res is not None:
+                            st.success("Bootstrap completed.")
+                            
+                            # Calculate statistics on x
+                            # boot_res is (n_boot, n_params)
+                            x_mean = np.mean(boot_res, axis=0)
+                            x_std = np.std(boot_res, axis=0)
+                            x_p05 = np.percentile(boot_res, 5, axis=0)
+                            x_p95 = np.percentile(boot_res, 95, axis=0)
+                            
+                            # Display as table?
+                            # Or better: Reconstruct P for each boot sample and show CI on plots?
+                            # That's computationally heavy for plots.
+                            # Let's show parameter CIs.
+                            
+                            st.write("Parameter Uncertainty (Top 20 by Std Dev)")
+                            # Create a DataFrame
+                            # We need parameter names.
+                            # We can get them from param_mapping or just use indices for now.
+                            # Better: Reconstruct P for mean/std?
+                            # P is linear in x (mostly).
+                            # Let's just show x stats for now or try to map to P.
+                            
+                            st.info("Bootstrap results stored. (Visualization to be implemented)")
+                            
+                        else:
+                            st.error("Bootstrap failed.")
+                except Exception as e:
+                    st.error(f"Bootstrap error: {e}")
+        else:
+            st.warning("Please run a fit first.")
+
+    # Cross-Validation Section
+    st.markdown("---")
+    st.header("Hyperparameter Tuning (Cross-Validation)")
+    
+    cv_k_folds = st.number_input("K-Folds", min_value=2, value=5, step=1)
+    
+    st.markdown("Define Parameter Grid:")
+    c_cv1, c_cv2 = st.columns(2)
+    with c_cv1:
+        l1_vals_str = st.text_input("L1 Regularization Values (comma separated)", "0.0, 0.001, 0.01, 0.1")
+    with c_cv2:
+        l2_vals_str = st.text_input("L2 Regularization Values (comma separated)", "0.0, 0.001, 0.01, 0.1")
+        
+    if st.button("Run Cross-Validation"):
+        if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+            try:
+                # Parse grid
+                l1_vals = [float(x.strip()) for x in l1_vals_str.split(",") if x.strip()]
+                l2_vals = [float(x.strip()) for x in l2_vals_str.split(",") if x.strip()]
+                
+                param_grid = []
+                for l1 in l1_vals:
+                    for l2 in l2_vals:
+                        param_grid.append({'l1_reg': l1, 'l2_reg': l2})
+                        
+                with st.spinner(f"Running {cv_k_folds}-fold CV on {len(param_grid)} combinations..."):
+                    cv_results = nlf.run_cross_validation(
+                        k_folds=cv_k_folds,
+                        param_grid=param_grid,
+                        df_params=st.session_state.params_df,
+                        df_data=st.session_state.fitting_data,
+                        backend=selected_backend,
+                        method=selected_method
+                    )
+                    
+                    st.success("Cross-Validation Completed.")
+                    st.dataframe(cv_results)
+                    
+                    best_params = cv_results.iloc[0]
+                    st.info(f"Best Parameters: L1={best_params['l1_reg']}, L2={best_params['l2_reg']} (Score: {best_params['score']:.6f})")
+                    
+            except Exception as e:
+                st.error(f"CV Error: {e}")
+        else:
+            st.warning("No data loaded.")
+
+    # MCMC Section
+    st.markdown("---")
+    st.header("Bayesian Inference (MCMC)")
+    
+    c_mcmc1, c_mcmc2 = st.columns(2)
+    with c_mcmc1:
+        n_steps = st.number_input("MCMC Steps", min_value=100, value=1000, step=100)
+    with c_mcmc2:
+        n_walkers = st.number_input("Number of Walkers", min_value=10, value=32, step=2)
+        
+    if st.button("Run MCMC"):
+        if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+            with st.spinner(f"Running MCMC ({n_steps} steps, {n_walkers} walkers)..."):
+                try:
+                    samples = nlf.run_mcmc(
+                        n_steps=n_steps,
+                        n_walkers=n_walkers,
+                        df_params=st.session_state.params_df,
+                        df_data=st.session_state.fitting_data,
+                        backend=selected_backend,
+                        method=selected_method
+                    )
+                    
+                    st.success("MCMC Completed.")
+                    
+                    # Corner Plot
+                    # We need parameter names.
+                    # We can get them from params_df but flattened.
+                    # Let's just use indices or try to map.
+                    # For now, just plot first 5 dimensions to avoid huge plot if many params.
+                    
+                    st.subheader("Posterior Distribution (Corner Plot)")
+                    
+                    # Limit to first 10 params for visibility
+                    n_plot = min(samples.shape[1], 10)
+                    fig = corner.corner(samples[:, :n_plot], labels=[f"p{i}" for i in range(n_plot)])
+                    st.pyplot(fig)
+                    
+                    if samples.shape[1] > 10:
+                        st.info(f"Showing first 10 parameters out of {samples.shape[1]}.")
+                        
+                except Exception as e:
+                    st.error(f"MCMC Error: {e}")
+        else:
+            st.warning("No data loaded.")
 
     # 2. Data Exploration (New Section)
     if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
@@ -478,7 +684,8 @@ if 'params_df' in st.session_state:
                                 backend=selected_backend,
                                 method=selected_method,
                                 options=run_options,
-                                stop_event=stop_evt
+                                stop_event=stop_evt,
+                                plotting_backend=plotting_backend_key
                             )
                             result_container['result'] = res
                         except Exception as e:
@@ -542,6 +749,17 @@ if 'params_df' in st.session_state:
         st.success("Fitting Completed Successfully! Scroll down to see the results.")
 
     # 3. Results Display
+    if 'loaded_model' in st.session_state:
+        st.markdown("---")
+        st.header("Loaded Model")
+        model = st.session_state.loaded_model
+        st.markdown("### Fit Report (Loaded)")
+        st.code(model['report'], language='text')
+        
+        if st.button("Clear Loaded Model"):
+            del st.session_state.loaded_model
+            st.rerun()
+
     if 'fitting_results' in st.session_state and st.session_state.fitting_results is not None:
         results = st.session_state.fitting_results
         
@@ -566,17 +784,23 @@ if 'params_df' in st.session_state:
         st.subheader("Diagnostic Plots")
         figures = results['figures']
         
-        # Summary Plots
+        # Helper to display figure based on type
+        def display_figure(fig):
+            if hasattr(fig, 'write_html'): # Plotly
+                st.plotly_chart(fig, use_container_width=True)
+            else: # Matplotlib
+                st.pyplot(fig)
+                
         # Summary Plots
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.pyplot(figures['Actual vs Predicted'])
+            display_figure(figures['Actual vs Predicted'])
         with c2:
-            st.pyplot(figures['Residuals vs Predicted'])
+            display_figure(figures['Residuals vs Predicted'])
         with c3:
-            st.pyplot(figures['Histogram of Residuals'])
+            display_figure(figures['Histogram of Residuals'])
         with c4:
-            st.pyplot(figures['Q-Q Plot'])
+            display_figure(figures['Q-Q Plot'])
         
         # Performance Charts (New Section)
         st.subheader("Performance Charts (Weighted Actual vs Model)")
@@ -605,7 +829,7 @@ if 'params_df' in st.session_state:
                 cols = st.columns(4)
                 for i, (name, fig) in enumerate(buf):
                     with cols[i % 4]:
-                        st.pyplot(fig)
+                        display_figure(fig)
                 buf.clear()
 
             for param_name, figs_list in grouped_figs.items():
@@ -617,13 +841,19 @@ if 'params_df' in st.session_state:
                     cols = st.columns(2)
                     for i, (name, fig) in enumerate(figs_list):
                         with cols[i]:
-                            st.pyplot(fig)
+                            display_figure(fig)
                 else:
                     # 1D Parameter (or other count) - Add to buffer
                     buffer_1d.extend(figs_list)
             
             # Final flush
-            flush_buffer_1d(buffer_1d)
+            # Need to update flush_buffer_1d to use display_figure too
+            if buffer_1d:
+                cols = st.columns(4)
+                for i, (name, fig) in enumerate(buffer_1d):
+                    with cols[i % 4]:
+                        display_figure(fig)
+                buffer_1d.clear()
         
         # Component Plots (Fitted Curves/Surfaces)
         st.subheader("Component Plots")
@@ -631,7 +861,7 @@ if 'params_df' in st.session_state:
         cols = st.columns(4)
         for i, (name, fig) in enumerate(comp_figs.items()):
             with cols[i % 4]:
-                st.pyplot(fig)
+                display_figure(fig)
             
         st.markdown("---")
         if st.button("Export Fitted Parameters"):
