@@ -1,13 +1,35 @@
 import streamlit as st
 import pandas as pd
+import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
 import nonlinear_fitting_numba as nlf
+import data_exploration as de
 import time
 import os
 import glob
 
 st.set_page_config(page_title="Nonlinear Fitting Tool", layout="wide")
+
+# Inject CSS to hide header and stop cursor blinking
+st.markdown("""
+    <style>
+        /* Hide Streamlit's running man/header */
+        header {visibility: hidden;}
+        
+        /* Stop input caret blinking */
+        input, textarea {
+            caret-color: black;
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                scroll-behavior: auto !important;
+            }
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 def get_next_version_filename(base_name="parameter_fitted"):
     files = glob.glob(f"{base_name}_v*.csv")
@@ -41,7 +63,74 @@ if st.sidebar.button("Reload Parameters"):
     st.cache_data.clear()
     if 'params_df' in st.session_state:
         del st.session_state.params_df
-    st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.header("Fitting Configuration")
+
+backend_options = {
+    "Scipy Least Squares": "scipy_ls",
+    "Scipy Minimize (QP)": "scipy_min",
+    "Linearized Least Squares (Fastest)": "linearized_ls",
+    "Poisson Loss (L-BFGS-B)": "poisson_lbfgsb",
+    "Poisson Loss (CuPy Accelerated)": "poisson_cupy",
+    "NLopt": "nlopt",
+    "CuPy (Legacy Placeholder)": "cupy"
+}
+
+selected_backend_label = st.sidebar.selectbox("Fitting Backend", list(backend_options.keys()), index=3)
+selected_backend = backend_options[selected_backend_label]
+
+# Dynamic Method Selection
+method_options = []
+default_method = 0
+
+if selected_backend == "scipy_ls":
+    method_options = ["trf", "dogbox", "lm"]
+elif selected_backend == "scipy_min":
+    method_options = ["trust-constr", "SLSQP", "L-BFGS-B"]
+elif selected_backend == "linearized_ls":
+    method_options = ["lsq_linear"]
+elif selected_backend == "poisson_lbfgsb":
+    method_options = ["L-BFGS-B"]
+elif selected_backend == "poisson_cupy":
+    method_options = ["L-BFGS-B"]
+elif selected_backend == "nlopt":
+    method_options = ["LD_SLSQP", "LD_MMA", "LD_LBFGS", "LN_COBYLA"]
+
+selected_method = st.sidebar.selectbox("Method", method_options, index=default_method)
+
+# Solver Options
+st.sidebar.markdown("#### Solver Options")
+max_iter = st.sidebar.number_input("Max Iterations", min_value=100, value=1000, step=100)
+tolerance = st.sidebar.number_input("Tolerance (1e-X)", min_value=1, max_value=12, value=6, step=1)
+tol_val = 10**(-tolerance)
+ignore_weights = st.sidebar.checkbox("Ignore weights during fitting (use w=1)", value=False)
+
+# Robust Loss (Only for Scipy Least Squares)
+loss_function = "linear"
+if selected_backend == "scipy_ls":
+    loss_function = st.sidebar.selectbox(
+        "Loss Function (Robust)", 
+        ["linear", "soft_l1", "huber", "cauchy", "arctan"],
+        index=0,
+        help="Robust loss functions reduce the influence of outliers."
+    )
+
+# Multi-Start Optimization
+st.sidebar.markdown("#### Multi-Start")
+enable_multistart = st.sidebar.checkbox("Enable Multi-Start", value=False)
+n_starts = 1
+if enable_multistart:
+    n_starts = st.sidebar.number_input("Number of Starts", min_value=2, value=3, step=1)
+
+st.sidebar.markdown("#### Regularization")
+# Regularization is not supported by Linearized LS
+reg_disabled = (selected_backend == "linearized_ls")
+if reg_disabled:
+    st.sidebar.caption("Not supported by selected backend")
+
+l1_reg = st.sidebar.number_input("L1 Regularization", min_value=0.0, value=0.0, step=0.01, format="%.4f", disabled=reg_disabled)
+l2_reg = st.sidebar.number_input("L2 Regularization", min_value=0.0, value=0.0, step=0.01, format="%.4f", disabled=reg_disabled)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Data Configuration")
@@ -49,7 +138,7 @@ st.sidebar.header("Data Configuration")
 # Data Source Selection Logic
 data_source = st.sidebar.radio("Data Source", ["Generate Data", "Load Data File"])
 
-sample_size = st.sidebar.number_input("Sample Size", min_value=1000, value=100000, step=1000)
+sample_size = st.sidebar.number_input("Sample Size", min_value=1000, value=100000, step=10000)
 
 data_file = None
 if data_source == "Load Data File":
@@ -71,40 +160,99 @@ if 'params_df' not in st.session_state:
     if df is not None:
         st.session_state.params_df = df
 
+# 1b. Load Data (Auto-load)
+@st.cache_data
+def load_data_file(uploaded_file):
+    try:
+        if uploaded_file.name.endswith(".parquet"):
+            return pl.read_parquet(uploaded_file)
+        else:
+            return pl.read_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return None
+
+# Initialize fitting_data if needed
+if 'fitting_data' not in st.session_state:
+    st.session_state.fitting_data = None
+
+if data_source == "Load Data File" and data_file:
+    # Load raw data
+    df_loaded = load_data_file(data_file)
+    
+    if df_loaded is not None:
+        # Process Data (Sampling & Weights)
+        # We re-process if inputs change, but loading is cached
+        try:
+            # Sampling
+            if len(df_loaded) > sample_size:
+                df_data = df_loaded.sample(n=sample_size, seed=42)
+            else:
+                df_data = df_loaded
+            
+            # Weight Calculation
+            if ignore_weights:
+                df_data = df_data.with_columns(pl.lit(1.0).alias('w'))
+            elif 'weight' in df_data.columns:
+                df_data = df_data.with_columns(pl.col('weight').alias('w'))
+            elif 'w' in df_data.columns:
+                pass # Already has w
+            elif 'balance' in df_data.columns:
+                # w = 1 / sqrt(balance)
+                df_data = df_data.with_columns(
+                    (1.0 / (pl.col('balance').clip(1e-6, None).sqrt())).alias('w')
+                )
+            else:
+                df_data = df_data.with_columns(pl.lit(1.0).alias('w'))
+                
+            st.session_state.fitting_data = df_data
+            
+            # Clear exploration results since data changed
+            if 'exploration_results' in st.session_state:
+                st.session_state.exploration_results = None
+            
+        except Exception as e:
+            st.error(f"Error processing data: {e}")
+
 if 'params_df' in st.session_state:
     # Streamlit 1.51.0 supports data_editor for direct editing.
     # We use st.data_editor to allow users to edit the dataframe directly.
     
-    st.markdown("### Edit Parameters")
-    st.markdown("You can edit values directly in the table below.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Parameter")
+        
+        # Configure column settings for better UX
+        column_config = {
+            "RiskFactor_NM": st.column_config.TextColumn("Risk Factor"),
+            "Sub_Model": st.column_config.TextColumn("Sub Model"),
+            "RiskFactor": st.column_config.NumberColumn("Value", format="%.4f"),
+            "On_Off": st.column_config.TextColumn("On/Off"),
+            "Fixed": st.column_config.TextColumn("Fixed"),
+            "Monotonicity": st.column_config.TextColumn("Monotonicity"),
+        }
+        
+        edited_df = st.data_editor(
+            st.session_state.params_df,
+            column_config=column_config,
+            # num_rows="dynamic", # Removed to improve copy-paste stability for existing rows
+            width='content', # Fix column width to contents
+            height=400,
+            key="data_editor"
+        )
     
-    # Configure column settings for better UX
-    # We enable all columns to support full table copy/paste from Excel.
-    column_config = {
-        "RiskFactor_NM": st.column_config.TextColumn("Risk Factor"),
-        "Sub_Model": st.column_config.TextColumn("Sub Model"),
-        "RiskFactor": st.column_config.NumberColumn("Value", format="%.4f"),
-        "On_Off": st.column_config.SelectboxColumn("On/Off", options=["Y", "N"]),
-        "Fixed": st.column_config.SelectboxColumn("Fixed", options=["Y", "N"]),
-        "Monotonicity": st.column_config.TextColumn("Monotonicity"), # Keep as text to allow "nan" or numbers
-    }
+    with c2:
+        st.markdown("### Data Preview")
+        if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+            st.dataframe(st.session_state.fitting_data.head(20), width='stretch', height=400)
+        elif 'fitting_results' in st.session_state and st.session_state.fitting_results is not None and 'data' in st.session_state.fitting_results:
+             # Fallback to results if available (e.g. from old run)
+             st.dataframe(st.session_state.fitting_results['data'].head(20), width='stretch', height=400)
+        else:
+            st.info("No data available. Upload a file or run fitting to generate.")
 
-    edited_df = st.data_editor(
-        st.session_state.params_df,
-        column_config=column_config,
-        # num_rows="dynamic", # Removed to improve copy-paste stability for existing rows
-        use_container_width=True, # Keeping this for now despite warning to ensure layout stability
-        height=400,
-        key="data_editor"
-    )
-    
     # Update session state with edits
     st.session_state.params_df = edited_df
-
-    # Update session state with edits
-    st.session_state.params_df = edited_df
-
-    st.info("💡 Tip: You can copy and paste cells directly within the table (Ctrl+C / Ctrl+V).")
 
     st.markdown("---")
     if st.button("Save Parameters to CSV"):
@@ -114,112 +262,305 @@ if 'params_df' in st.session_state:
         except Exception as e:
             st.error(f"Error saving file: {e}")
 
-    # 2. Fitting Control
+    # 2. Data Exploration (New Section)
+    if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+        st.markdown("---")
+        st.header("Data Exploration")
+        
+        # Initialize exploration state
+        if 'exploration_results' not in st.session_state:
+            st.session_state.exploration_results = None
+            
+        if st.button("Analyze Data"):
+            with st.spinner("Analyzing data..."):
+                df_explore = st.session_state.fitting_data
+                numeric_cols = [col for col in df_explore.columns if df_explore[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
+                
+                # Reorder: 'y' first if exists
+                if 'y' in numeric_cols:
+                    numeric_cols.remove('y')
+                    numeric_cols.insert(0, 'y')
+                
+                # Pre-calculate and filter valid analyses
+                valid_analyses = []
+                for var_name in numeric_cols:
+                    analysis = de.analyze_distribution(df_explore[var_name])
+                    if analysis is not None:
+                        valid_analyses.append((var_name, analysis))
+                        
+                # Store results
+                st.session_state.exploration_results = {
+                    'valid_analyses': valid_analyses,
+                    'df_explore': df_explore # Store ref to data used
+                }
+        
+        # Display Results if available
+        if st.session_state.exploration_results:
+            results = st.session_state.exploration_results
+            valid_analyses = results['valid_analyses']
+            df_explore_cached = results['df_explore']
+            
+            # 1. Variable Distributions (Grid Layout)
+            st.subheader("Variable Distributions")
+            
+            # Chunk valid analyses into groups of 4
+            chunk_size = 4
+            for i in range(0, len(valid_analyses), chunk_size):
+                cols = st.columns(chunk_size)
+                chunk = valid_analyses[i:i+chunk_size]
+                
+                for j, (var_name, analysis) in enumerate(chunk):
+                    with cols[j]:
+                        # Custom Title for Dependent Variable
+                        plot_title = var_name
+                        if var_name == 'y':
+                            # Calculate % Zero
+                            n_zeros = (df_explore_cached[var_name] == 0).sum()
+                            pct_zero = (n_zeros / len(df_explore_cached)) * 100
+                            plot_title = f"{var_name} (% Zero: {pct_zero:.1f}%)"
+                        
+                        # Plot
+                        fig_dist = de.plot_distribution(analysis, var_name, title=plot_title)
+                        if fig_dist:
+                            st.pyplot(fig_dist)
+                            plt.close(fig_dist) # Close to free memory
+    
+            # 2. Correlation Matrix (At the end)
+            st.subheader("Correlation Matrix")
+            
+            # Place in a column to match the size of other plots (1/4 width)
+            c_corr = st.columns(4)
+            with c_corr[0]:
+                fig_corr = de.plot_correlation_matrix(df_explore_cached)
+                if fig_corr:
+                    st.pyplot(fig_corr)
+                    plt.close(fig_corr)
+                else:
+                    st.info("Not enough numeric columns.")
+
+    # 3. Fitting Control
+    st.markdown("---")
     st.markdown("### Fitting Control")
     
+    # Initialize session state for running status
+    if 'is_running' not in st.session_state:
+        st.session_state.is_running = False
+        
+
+
+    # Initialize session state for running status and errors
+    if 'is_running' not in st.session_state:
+        st.session_state.is_running = False
+    if 'fitting_error' not in st.session_state:
+        st.session_state.fitting_error = None
+    if 'fitting_success' not in st.session_state:
+        st.session_state.fitting_success = False
+        
+    # ... (Data Loading Logic skipped in this replacement block, assuming it's above) ...
+
     col1, col2 = st.columns([1, 4])
     with col1:
-        start_btn = st.button("Start Fitting")
-    
-    if start_btn:
-        st.info("Starting optimization process...")
+        if not st.session_state.is_running:
+            if st.button("Start"):
+                st.session_state.is_running = True
+                st.session_state.fitting_error = None # Clear previous errors
+                st.session_state.fitting_results = None # Clear previous results
+                st.session_state.fitting_success = False # Clear success message
+                st.rerun()
+        else:
+            if st.button("Stop"):
+                st.session_state.is_running = False
+                # Signal thread to stop
+                if 'stop_event' in st.session_state and st.session_state.stop_event:
+                    st.session_state.stop_event.set()
+                st.rerun()
+                
+    # Handle Stop / Cleanup if thread is running but is_running is False
+    if not st.session_state.is_running and 'fitting_thread' in st.session_state and st.session_state.fitting_thread and st.session_state.fitting_thread.is_alive():
+        st.warning("Stopping optimization...")
+        if 'stop_event' in st.session_state and st.session_state.stop_event:
+            st.session_state.stop_event.set()
         
+        # Wait for thread (with timeout to avoid hanging UI too long, though join is blocking)
+        # Since we set the event, the thread should exit quickly.
+        st.session_state.fitting_thread.join(timeout=5.0)
+        
+        if st.session_state.fitting_thread.is_alive():
+             st.error("Thread did not stop in time.")
+        else:
+             st.success("Optimization stopped.")
+             
+        # Cleanup
+        st.session_state.fitting_thread = None
+        st.session_state.stop_event = None
+        st.rerun()
+                
+    # Display Error if exists
+    if st.session_state.fitting_error:
+        st.error(f"An error occurred during fitting: {st.session_state.fitting_error}")
+    
+    if st.session_state.is_running:
+        # Progress UI placeholders
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        def update_progress(p, text):
-            progress_bar.progress(p)
-            status_text.text(text)
-            
         # Data Handling Logic
         df_data = None
         true_values = None
         
-        try:
-            # Load Model Spec first to get components for generation
-            components = nlf.load_model_spec(df=edited_df)
+        # Threading Setup
+        import threading
+        if 'fitting_thread' not in st.session_state:
+            st.session_state.fitting_thread = None
+        if 'stop_event' not in st.session_state:
+            st.session_state.stop_event = None
+        if 'thread_result' not in st.session_state:
+            st.session_state.thread_result = None
+        if 'thread_error' not in st.session_state:
+            st.session_state.thread_error = None
+        if 'progress_container' not in st.session_state:
+            st.session_state.progress_container = {'progress': 0.0, 'text': "Initializing..."}
             
-            if data_source == "Load Data File" and data_file:
-                update_progress(0.1, f"Loading data from {data_file.name}...")
+        # Start Thread if not running
+        if st.session_state.fitting_thread is None:
+            # Only start if we haven't finished yet (result is None)
+            if st.session_state.thread_result is None and st.session_state.thread_error is None:
                 try:
-                    if data_file.name.endswith(".parquet"):
-                        df_loaded = pd.read_parquet(data_file)
-                    else:
-                        df_loaded = pd.read_csv(data_file)
+                    # Ensure parameters are available
+                    if 'params_df' not in st.session_state or st.session_state.params_df is None:
+                        raise ValueError("Parameters not loaded.")
                     
-                    # Sampling
-                    if len(df_loaded) > sample_size:
-                        update_progress(0.15, f"Sampling {sample_size} rows from {len(df_loaded)}...")
-                        df_data = df_loaded.sample(n=sample_size)
-                    else:
-                        df_data = df_loaded
+                    df_params_run = st.session_state.params_df
+                    components = nlf.load_model_spec(df=df_params_run)
                     
-                    # Weight Calculation
-                    if 'balance' in df_data.columns:
-                        # w = 1 / sqrt(balance)
-                        # Handle zeros/negatives by clipping to small epsilon
-                        balance = df_data['balance'].clip(lower=1e-6)
-                        df_data['w'] = 1.0 / np.sqrt(balance)
-                        update_progress(0.18, "Calculated weights from 'balance' column.")
-                    elif 'w' not in df_data.columns:
-                        df_data['w'] = 1.0
-                        update_progress(0.18, "No 'balance' or 'w' column found. Using default weights (1.0).")
+                    if data_source == "Load Data File":
+                        if st.session_state.fitting_data is not None:
+                            df_data = st.session_state.fitting_data
+                            status_text.text("Using loaded data...")
+                        else:
+                            raise ValueError("No data loaded. Please upload a file.")
+                    else:
+                        # Generate Data
+                        status_text.text(f"Generating {sample_size} rows of synthetic data...")
+                        df_data, true_values = nlf.generate_data(components, n_samples=sample_size)
                         
-                except Exception as e:
-                    st.error(f"Failed to load data file: {e}")
-                    st.stop()
-            else:
-                # Generate Data
-                update_progress(0.1, f"Generating {sample_size} rows of synthetic data...")
-                df_data, true_values = nlf.generate_data(components, n_samples=sample_size)
-                
-                # Save generated data to parquet
-                save_path = "generated_data.parquet"
-                df_data.to_parquet(save_path)
-                st.info(f"Generated data saved to {os.path.abspath(save_path)}")
+                        # Save generated data to parquet
+                        save_path = "generated_data.parquet"
+                        df_data.write_parquet(save_path)
+                        st.info(f"Generated data saved to {os.path.abspath(save_path)}")
+                        st.session_state.fitting_data = df_data
 
-            # Run Fitting with prepared data
-            results = nlf.run_fitting_api(
-                df_params=edited_df,
-                df_data=df_data,
-                true_values=true_values,
-                progress_callback=update_progress
-            )
-            
-            st.session_state.fitting_results = results
-            st.success("Fitting Completed!")
-            
-        except Exception as e:
-            st.error(f"An error occurred during fitting: {e}")
-            raise e
+                    # Run Fitting with prepared data
+                    run_options = {
+                        'maxiter': max_iter, 
+                        'ftol': tol_val, 
+                        'gtol': tol_val,
+                        'l1_reg': l1_reg,
+                        'l2_reg': l2_reg,
+                        'loss': loss_function,
+                        'n_starts': n_starts
+                    }
+                    
+                    # Define Thread Target
+                    def fitting_worker(stop_evt, result_container, progress_container):
+                        try:
+                            print("Starting fitting thread...")
+                            
+                            def thread_progress_callback(p, text):
+                                progress_container['progress'] = p
+                                progress_container['text'] = text
+                                
+                            res = nlf.run_fitting_api(
+                                df_params=df_params_run,
+                                df_data=df_data,
+                                true_values=true_values,
+                                progress_callback=thread_progress_callback,
+                                backend=selected_backend,
+                                method=selected_method,
+                                options=run_options,
+                                stop_event=stop_evt
+                            )
+                            result_container['result'] = res
+                        except Exception as e:
+                            result_container['error'] = str(e)
+                            print(f"Thread error: {e}")
+
+                    # Create Event and Thread
+                    stop_event = threading.Event()
+                    result_container = {} # Mutable dict to store result
+                    progress_container = st.session_state.progress_container
+                    
+                    t = threading.Thread(target=fitting_worker, args=(stop_event, result_container, progress_container))
+                    
+                    # Store in session state
+                    st.session_state.stop_event = stop_event
+                    st.session_state.fitting_thread = t
+                    st.session_state.result_container = result_container
+                    
+                    t.start()
+                    st.rerun() # Rerun to enter the monitoring loop
+                    
+                except Exception as e:
+                    st.session_state.fitting_error = str(e)
+                    st.session_state.is_running = False
+                    st.rerun()
+        
+        # Monitor Thread
+        if st.session_state.fitting_thread:
+            if st.session_state.fitting_thread.is_alive():
+                # Update Progress from container
+                if 'progress_container' in st.session_state:
+                    pc = st.session_state.progress_container
+                    progress_bar.progress(pc['progress'])
+                    status_text.text(f"Optimization running... {pc['text']}")
+                else:
+                    st.info("Optimization running in background...")
+                
+                time.sleep(0.5) # Refresh rate
+                st.rerun()
+            else:
+                # Thread finished
+                t = st.session_state.fitting_thread
+                t.join() # Should be immediate
+                
+                container = st.session_state.result_container
+                if 'error' in container:
+                    st.session_state.fitting_error = container['error']
+                elif 'result' in container:
+                    st.session_state.fitting_results = container['result']
+                    st.session_state.fitting_success = True
+                    # st.success("Fitting Completed!") # Removed to avoid blink
+                
+                # Cleanup
+                st.session_state.fitting_thread = None
+                st.session_state.stop_event = None
+                st.session_state.is_running = False
+                st.rerun()
+
+    # Display Success Message (Persistent)
+    if st.session_state.get('fitting_success', False):
+        st.success("Fitting Completed Successfully! Scroll down to see the results.")
 
     # 3. Results Display
-    if 'fitting_results' in st.session_state:
+    if 'fitting_results' in st.session_state and st.session_state.fitting_results is not None:
         results = st.session_state.fitting_results
         
         st.markdown("---")
         st.header("Results")
         
         # Metrics
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Success", str(results['success']))
-        m2.metric("Final Cost", f"{results['cost']:.4f}")
-        m3.metric("Time Elapsed", f"{results['time']:.2f} s")
-        
-        if 'metrics' in results:
-            mets = results['metrics']
-            m4, m5, m6, m7 = st.columns(4)
-            m4.metric("R-squared", f"{mets['R2']:.4f}")
-            m5.metric("RMSE", f"{mets['RMSE']:.4f}")
-            m6.metric("MAE", f"{mets['MAE']:.4f}")
-            m7.metric("N Samples", f"{mets['n_samples']:,}")
-        
+        # Fit Report (Consolidated Results)
+        if 'report' in results:
+            st.markdown("### Fit Statistics")
+            st.code(results['report'], language='text')
+            
         # Fitted Parameters (Compact)
-        with st.expander("Fitted Parameters Table"):
-            display_df = results['fitted_params'].copy()
-            display_df['X1_Knot'] = display_df['X1_Knot'].astype(str)
-            display_df['X2_Knot'] = display_df['X2_Knot'].astype(str)
-            st.dataframe(display_df)
+        if 'fitted_params' in results:
+            with st.expander("Fitted Parameters Table"):
+                display_df = results['fitted_params'].copy()
+                display_df['X1_Knot'] = display_df['X1_Knot'].astype(str)
+                display_df['X2_Knot'] = display_df['X2_Knot'].astype(str)
+                st.dataframe(display_df)
         
         # Plots
         st.subheader("Diagnostic Plots")

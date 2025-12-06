@@ -1,0 +1,12 @@
+Name,Backend,Method,Time (s),Final Cost,Success
+NLopt (LD_SLSQP),nlopt,LD_SLSQP,4.319947957992554,2946910.1907220865,True
+Scipy Minimize (L-BFGS-B),scipy_min,L-BFGS-B,0.22452306747436523,2947103.716344555,True
+Scipy Minimize (SLSQP),scipy_min,SLSQP,0.7944273948669434,2947790.5333162984,False
+Scipy LeastSquares (TRF),scipy_ls,trf,5.4049177169799805,2947790.5577031286,True
+Scipy Minimize (Trust-Constr),scipy_min,trust-constr,6.275064706802368,2947790.559546681,True
+Poisson Loss (CuPy),poisson_cupy,L-BFGS-B,2.5439066886901855,2948315.8926592926,True
+Scipy LeastSquares (Dogbox),scipy_ls,dogbox,6.757324934005737,2949130.022343352,True
+Linearized LS (Fastest),linearized_ls,lsq_linear,0.3316919803619385,3197145.2020439077,True
+NLopt (LD_LBFGS),nlopt,LD_LBFGS,0.031093358993530273,inf,False
+Poisson Loss (L-BFGS-B),poisson_lbfgsb,L-BFGS-B,,,False
+CuPy (Simple GD),cupy,GradientDescent,,,False
