@@ -5,6 +5,8 @@ import scipy.optimize
 import scipy.sparse
 import scipy.stats
 import time
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numba
 import numexpr as ne
@@ -2125,6 +2127,8 @@ def run_fitting(backend='scipy_ls', method='trf'):
 
 def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=None, residuals=None):
     # Version that returns figures instead of saving them
+    # Uses Object-Oriented Matplotlib to avoid global state and GUI thread issues
+    from matplotlib.figure import Figure
     figures = {}
     
     # If y_pred is not provided, compute it (fallback)
@@ -2148,16 +2152,17 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
         y_pred_plot = y_pred
         res_plot = residuals
 
-    fig = plt.figure(figsize=(10, 6))
-    plt.scatter(y_true_plot, y_pred_plot, alpha=0.3, s=10)
-    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
-    plt.xlabel('True Y')
-    plt.ylabel('Predicted Y')
-    plt.title(f'Actual vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    # 1. Actual vs Predicted
+    fig = Figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    ax.scatter(y_true_plot, y_pred_plot, alpha=0.3, s=10)
+    ax.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    ax.set_xlabel('True Y')
+    ax.set_ylabel('Predicted Y')
+    ax.set_title(f'Actual vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
     figures['Actual vs Predicted'] = fig
-    plt.close()
     
-    # Helper functions moved to module level
+    # Helper functions must be available in scope
     # get_centered_weighted_stats
     # get_centered_weighted_stats_2d
 
@@ -2177,8 +2182,8 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
         
         if comp['type'] == 'DIM_1':
             # --- Performance Chart ---
-            # --- Performance Chart ---
-            fig_perf, ax = plt.subplots(figsize=(10, 6))
+            fig_perf = Figure(figsize=(10, 6))
+            ax = fig_perf.add_subplot(111)
             
             # Plot Weighted Actuals
             stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'], data)
@@ -2196,24 +2201,23 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax.legend()
             ax.grid(True, alpha=0.3)
             figures[f"Performance: {comp['name']}"] = fig_perf
-            plt.close()
             
             # --- Component Plot (Restored) ---
-            fig_comp = plt.figure(figsize=(8, 5))
+            fig_comp = Figure(figsize=(8, 5))
+            ax = fig_comp.add_subplot(111)
             
             # Recalculate spline for component plot
             x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
             y_grid = np.interp(x_grid, comp['knots'], vals)
             
-            plt.plot(comp['knots'], vals, 'ro-', label='Fitted')
+            ax.plot(comp['knots'], vals, 'ro-', label='Fitted')
             if t_vals is not None:
-                plt.plot(comp['knots'], t_vals, 'g--', label='True')
+                ax.plot(comp['knots'], t_vals, 'g--', label='True')
             
-            plt.plot(x_grid, y_grid, 'b-', alpha=0.3)
-            plt.title(f"{comp['name']}")
-            plt.legend()
+            ax.plot(x_grid, y_grid, 'b-', alpha=0.3)
+            ax.set_title(f"{comp['name']}")
+            ax.legend()
             figures[f"Component: {comp['name']}"] = fig_comp
-            plt.close()
             
         elif comp['type'] == 'DIM_2':
             # --- Performance Charts (Slices) ---
@@ -2225,13 +2229,14 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2'], data
             )
             
-            # Helper to create subplot grid
-            def create_slice_grid(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis):
+            # Helper to create subplot grid - REIMPLEMENTED for OO
+            def create_slice_grid_oo(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis):
                 n_slices = len(slice_knots)
                 n_cols = 3
                 n_rows = int(np.ceil(n_slices / n_cols))
                 
-                fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), constrained_layout=True)
+                fig = Figure(figsize=(5 * n_cols, 4 * n_rows), constrained_layout=True)
+                axes = fig.subplots(n_rows, n_cols)
                 axes = np.atleast_1d(axes).flatten()
                 
                 for i in range(n_slices):
@@ -2258,7 +2263,7 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                     ax.set_ylabel('Response')
                     
                     # Add legend to the first subplot that has data, or the first one if none have data
-                    if i == 0 or (not axes[0].get_legend() and n_data > 0):
+                    if i == 0 or (n_data > 0 and len(ax.get_legend_handles_labels()[0]) > 0 and not ax.get_legend()):
                          ax.legend()
                          
                     ax.grid(True, alpha=0.3)
@@ -2270,7 +2275,7 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 return fig
 
             # 1. Slices along X2 (Fixed X1)
-            fig1 = create_slice_grid(
+            fig1 = create_slice_grid_oo(
                 slices_dim_name=comp['x1_var'],
                 x_axis_name=comp['x2_var'],
                 x_knots=comp['knots_x2'],
@@ -2281,10 +2286,9 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             )
             fig1.suptitle(f"Performance: {comp['name']} (By {comp['x1_var']})", fontsize=16)
             figures[f"Performance: {comp['name']} (By {comp['x1_var']})"] = fig1
-            plt.close()
             
             # 2. Slices along X1 (Fixed X2)
-            fig2 = create_slice_grid(
+            fig2 = create_slice_grid_oo(
                 slices_dim_name=comp['x2_var'],
                 x_axis_name=comp['x1_var'],
                 x_knots=comp['knots_x1'],
@@ -2295,16 +2299,12 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             )
             fig2.suptitle(f"Performance: {comp['name']} (By {comp['x2_var']})", fontsize=16)
             figures[f"Performance: {comp['name']} (By {comp['x2_var']})"] = fig2
-            plt.close()
-            
-            # Keep the surface plots as well? User said "create a grid... the same way as 1D charts".
-            # The slice grids replace the marginals/surfaces effectively for detailed view.
-            # I will omit the surface plots to avoid clutter, as the slices provide the requested view.
             
             # --- Component Plot (Restored) ---
             # If true values exist, show side-by-side. Else show only fitted.
             if t_vals is not None:
-                fig_hm, axes = plt.subplots(1, 2, figsize=(16, 6))
+                fig_hm = Figure(figsize=(16, 6))
+                axes = fig_hm.subplots(1, 2)
                 
                 grid = vals.reshape(comp['n_rows'], comp['n_cols'])
                 im1 = axes[0].imshow(grid, origin='lower', aspect='auto',
@@ -2320,7 +2320,8 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 axes[1].set_title(f"{comp['name']} (True)")
                 fig_hm.colorbar(im2, ax=axes[1])
             else:
-                fig_hm, ax = plt.subplots(1, 1, figsize=(8, 6))
+                fig_hm = Figure(figsize=(8, 6))
+                ax = fig_hm.add_subplot(111)
                 grid = vals.reshape(comp['n_rows'], comp['n_cols'])
                 im1 = ax.imshow(grid, origin='lower', aspect='auto',
                            extent=[comp['knots_x2'].min(), comp['knots_x2'].max(),
@@ -2329,30 +2330,29 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 fig_hm.colorbar(im1, ax=ax)
             
             figures[f"Component: {comp['name']}"] = fig_hm
-            plt.close()
 
-    fig = plt.figure(figsize=(10, 6))
-    plt.scatter(y_pred_plot, res_plot, alpha=0.3, s=10)
-    plt.axhline(0, color='r', linestyle='--')
-    plt.xlabel('Predicted Y')
-    plt.ylabel('Residuals')
-    plt.title(f'Residuals vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
+    fig = Figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    ax.scatter(y_pred_plot, res_plot, alpha=0.3, s=10)
+    ax.axhline(0, color='r', linestyle='--')
+    ax.set_xlabel('Predicted Y')
+    ax.set_ylabel('Residuals')
+    ax.set_title(f'Residuals vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
     figures['Residuals vs Predicted'] = fig
-    plt.close()
     
-    fig = plt.figure(figsize=(10, 6))
-    plt.hist(res_plot, bins=50, edgecolor='k', alpha=0.7)
-    plt.xlabel('Residual')
-    plt.ylabel('Frequency')
-    plt.title('Histogram of Residuals')
+    fig = Figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    ax.hist(res_plot, bins=50, edgecolor='k', alpha=0.7)
+    ax.set_xlabel('Residual')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Histogram of Residuals')
     figures['Histogram of Residuals'] = fig
-    plt.close()
     
-    fig = plt.figure(figsize=(10, 6))
-    scipy.stats.probplot(res_plot, dist="norm", plot=plt)
-    plt.title('Q-Q Plot')
+    fig = Figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    scipy.stats.probplot(res_plot, dist="norm", plot=ax) # plot=ax works for probplot
+    ax.set_title('Q-Q Plot')
     figures['Q-Q Plot'] = fig
-    plt.close()
     
     return figures
 
@@ -2654,66 +2654,145 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
     # Approximation: Hessian of LS cost ~ J.T @ J
     # H = M.T @ (A.T @ diag((y_pred/w)**2) @ A) @ M
     
+    # 6. Covariance Matrix and Standard Errors
+    # ... (Keep existing covariance logic) ...
     try:
-        # Compute diagonal weights D = (y_pred/w)**2
+        # Compute diagonal weights D = (y_pred/w)**2 for Least Squares approx
+        # For Poisson: D = y_pred^2? No, for Poisson Fisher Information is X' W X where W = diag(mu)
+        # But we are minimizing LS Cost. So H ~ J'J.
         D = (y_pred / w)**2
-        
-        # Compute A_weighted = sqrt(D) * A
-        # Actually, let's just compute A.T @ D @ A
-        # A is sparse.
-        # A_T_D_A = A.T @ sparse.diags(D) @ A
         
         from scipy import sparse
         D_mat = sparse.diags(D)
+        
+        # H = M.T @ (A.T @ D @ A) @ M
+        # A_T_D_A = A.T @ D @ A
+        # temp = A_T_D_A @ M
+        # H = M.T @ temp
+        
+        # Simplified: H approx based on unweighted J if weighted is unstable?
+        # Let's trust the LS approx for now.
         A_T_D_A = A.T @ D_mat @ A
+        H = M.T @ (A_T_D_A @ M)
         
-        # Now project to x space: H = M.T @ A_T_D_A @ M
-        # M is dense numpy array (reconstructed).
-        # A_T_D_A is sparse.
-        
-        # M is (n_P, n_x).
-        # H = M.T @ (A_T_D_A @ M)
-        temp = A_T_D_A @ M
-        H = M.T @ temp
-        
-        # Covariance = inv(H) * reduced_chisqr (scaled)
+        # Covariance = inv(H) * reduced_chisqr
         cov_x = np.linalg.inv(H) * red_chisqr
-        stderr_x = np.sqrt(np.diag(cov_x))
+        diag_cov = np.diag(cov_x)
+        # Handle negative variance (numerical instability)
+        diag_cov[diag_cov < 0] = 0
+        stderr_x = np.sqrt(diag_cov)
         
     except Exception as e:
         print(f"Warning: Could not compute covariance matrix: {e}")
         stderr_x = np.full(n_params, np.nan)
+
+    # --- New Metrics ---
+    # 1. Gini Coefficient
+    def gini(actual, pred, w):
+        # Sort by predicted risk (descending)
+        inds = np.argsort(pred)[::-1]
+        a_s = actual[inds]
+        p_s = pred[inds]
+        w_s = w[inds]
+        
+        cum_w = np.cumsum(w_s)
+        sum_w = cum_w[-1]
+        
+        cum_a = np.cumsum(a_s * w_s)
+        sum_a = cum_a[-1]
+        
+        # Lorentz curve coordinates
+        x = cum_w / sum_w
+        y = cum_a / sum_a
+        
+        # Gini = 1 - 2 * AUC (under Lorentz) ??? 
+        # Standard Gini: Area between diagonal and Lorentz curve / 0.5
+        # Area under diagonal is 0.5.
+        # Gini = (0.5 - AUC_Lorentz) / 0.5 = 1 - 2*AUC_Lorentz? 
+        # Wait, if perfect model, curve is bowed up. AUC > 0.5.
+        # Ideally we want Area Between Curve and Diagonal.
+        # Let's use trapezoidal rule for AUC.
+        auc = np.trapz(y, x)
+        g = 2 * auc - 1
+        return g
+
+    gini_val = gini(y_true, y_pred, w)
+
+    # 2. Pseudo R-squared (McFadden)
+    # 1 - (LL_model / LL_null)
+    # LL_null: Intercept only model. Predicted = weighted mean of y?
+    # For Poisson: mean = sum(w*y) / sum(w)? No, for Poisson regression, null model usually has mu = mean(y).
+    # Let's assume weighted mean for null model.
+    y_bar = np.average(y_true, weights=w)
+    # LL Null (Gaussian)
+    # -0.5 * sum( (y - y_bar)^2 * w ) ... ignoring constants for R2 ratio?
+    # No, LL must include constants for ratio to make sense?
+    # McFadden R2 is 1 - LL_mod / LL_null.
+    # LL = -0.5 * (N*log(2pi) + sum(log(w^2)) + sum((y-pred)^2/w^2 ? No w is 1/sigma).
+    # metric 'chisqr' calculated above is sum(residuals^2) where res=(y-pred)/w.
+    # So chisqr = sum( ( (y-pred)/w )^2 ) = sum( (y-pred)^2 * (1/w)^2 ). w here is std?
+    # In code: residuals = (y_true - y_pred) / w.
+    # So chisqr is weighted SS.
+    # LL_model = -0.5 * (chisqr + C)
+    # LL_null = -0.5 * (chisqr_null + C)
+    # This is tricky with weighted LS vs Likelihood.
+    # Let's use simple R2_pseudo = 1 - chisqr / chisqr_null
+    
+    res_null = (y_true - y_bar) / w
+    chisqr_null = np.sum(res_null**2)
+    pseudo_r2 = 1 - (chisqr / chisqr_null)
+    
+    # 3. Poisson Deviance
+    # D = 2 * sum( y * log(y/mu) - (y - mu) )
+    # Handle y=0: lim y->0 y*log(y/mu) = 0
+    # Add epsilon to y and mu
+    eps = 1e-10
+    term1 = y_true * np.log((y_true + eps) / (y_pred + eps))
+    term2 = y_true - y_pred
+    # Deviance usually for raw counts. Is y_true raw? Yes. w?
+    # Weighted Deviance? sum(w * deviance_i)?
+    # For Poisson regression, weights usually mean exposure.
+    # If w is just 1/sigma for LS, mixing is confusing.
+    # Let's calculate Unweighted Poisson Deviance for reference.
+    dev_i = 2 * (term1 - term2) # Wait, term2 is (y-mu)
+    # D = 2 * sum( y*log(y/mu) - (y-mu) )
+    # Correct.
+    poisson_deviance = np.sum(dev_i)
+    
         
     # 7. Format Report
     report = []
-    report.append("[Fit Statistics]")
-    # Handle res type
+    report.append("[Fit Summary]")
+    
     method_name = 'Unknown'
     if isinstance(res, dict):
         method_name = res.get('method', 'Unknown')
         success = res.get('success', 'Unknown')
     else:
-        method_name = 'Unknown'
         success = res.success if hasattr(res, 'success') else 'Unknown'
         if hasattr(res, 'message'):
             method_name = str(res.message)
             
-    report.append(f"    Fitting Method: {method_name}")
+    report.append(f"    Method:         {method_name}")
     report.append(f"    Success:        {success}")
     if elapsed_time is not None:
-        report.append(f"    Time Elapsed:   {elapsed_time:.4f} s")
+        report.append(f"    Time:           {elapsed_time:.4f} s")
+    report.append(f"    Iterations:     {res.nfev if hasattr(res, 'nfev') else 'N/A'}")
         
-    report.append(f"    Data points:    {n_samples}")
-    report.append(f"    Variables:      {n_free}")
-    report.append(f"    Chi-square:     {chisqr:.4f}")
-    report.append(f"    Reduced Chi-square: {red_chisqr:.4f}")
-    report.append(f"    AIC:            {aic:.4f}")
-    report.append(f"    BIC:            {bic:.4f}")
-    report.append(f"    R-squared:      {r_squared:.4f}")
-    report.append(f"    RMSE:           {rmse:.4f}")
-    report.append(f"    MAE:            {mae:.4f}")
-    
-    # Removed [Variables] section as requested
+    report.append("\n[Goodness of Fit]")
+    report.append(f"    RMSE:           {rmse:.5f}")
+    report.append(f"    MAE:            {mae:.5f}")
+    report.append(f"    R-squared:      {r_squared:.5f}")
+    report.append(f"    Pseudo R2:      {pseudo_r2:.5f}")
+    report.append(f"    Gini Coeff:     {gini_val:.5f}")
+    report.append(f"    P. Deviance:    {poisson_deviance:.2f}")
+
+    report.append("\n[Information Criteria]")
+    report.append(f"    AIC:            {aic:.2f}")
+    report.append(f"    BIC:            {bic:.2f}")
+    report.append(f"    Chi-square:     {chisqr:.2f}")
+    report.append(f"    Red. Chi-square:{red_chisqr:.4f}")
+    report.append(f"    DoF:            {dof}")
     
     report_str = "\n".join(report)
     
@@ -2879,6 +2958,8 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
     max_val = max(y_true_plot.max(), y_pred_plot.max())
     fig.add_shape(type="line", x0=min_val, y0=min_val, x1=max_val, y1=max_val,
                   line=dict(color="Red", dash="dash"))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
     figures['Actual vs Predicted'] = fig
     
     # 2. Residuals vs Predicted
@@ -2886,10 +2967,15 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
                      labels={'x': 'Predicted Y', 'y': 'Residuals'},
                      title=f'Residuals vs Predicted (Sampled {len(y_true_plot)}/{n_points})')
     fig.add_hline(y=0, line_dash="dash", line_color="red")
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
     figures['Residuals vs Predicted'] = fig
     
     # 3. Histogram of Residuals
     fig = px.histogram(res_plot, nbins=50, title='Histogram of Residuals', labels={'value': 'Residual'})
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_layout(showlegend=False)
     figures['Histogram of Residuals'] = fig
     
     # 4. Q-Q Plot (Manual construction for Plotly)
@@ -2905,6 +2991,9 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
     line_x = np.array([osm.min(), osm.max()])
     line_y = slope * line_x + intercept
     fig.add_trace(go.Scatter(x=line_x, y=line_y, mode='lines', name='Fit', line=dict(color='red')))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+    fig.update_layout(showlegend=False)
     figures['Q-Q Plot'] = fig
     
     # Get balance for weighting
@@ -2927,13 +3016,16 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
             stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'], data)
             
             fig_perf = go.Figure()
-            fig_perf.add_trace(go.Scatter(x=stats_act['x'], y=stats_act['y_mean'], mode='lines+markers', name='Weighted Actual', line=dict(color='red', dash='dash')))
-            fig_perf.add_trace(go.Scatter(x=stats_mod['x'], y=stats_mod['y_mean'], mode='lines+markers', name='Weighted Model', line=dict(color='green', dash='dash')))
+            fig_perf.add_trace(go.Scatter(x=stats_act['x'], y=stats_act['y_mean'], mode='lines+markers', name='Actual', line=dict(color='red')))
+            fig_perf.add_trace(go.Scatter(x=stats_mod['x'], y=stats_mod['y_mean'], mode='lines+markers', name='Model', line=dict(color='green')))
             
             # Count bins with data
             n_bins_with_data = stats_act['y_mean'].notna().sum()
-            fig_perf.update_layout(title=f"Performance: {comp['name']} ({len(comp['knots'])} knots, {n_bins_with_data} bins with data)",
-                                   xaxis_title=comp['x1_var'], yaxis_title='Response')
+            fig_perf.update_layout(title=f"{comp['name']} ({len(comp['knots'])} knots, {n_bins_with_data} bins with data)",
+                                   xaxis_title=comp['x1_var'], yaxis_title='Response',
+                                   legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.5)'))
+            fig_perf.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+            fig_perf.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
             figures[f"Performance: {comp['name']}"] = fig_perf
             
             # --- Component Plot ---
@@ -2941,13 +3033,11 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
             fig_comp.add_trace(go.Scatter(x=comp['knots'], y=vals, mode='lines+markers', name='Fitted', line=dict(color='red')))
             if t_vals is not None:
                 fig_comp.add_trace(go.Scatter(x=comp['knots'], y=t_vals, mode='lines', name='True', line=dict(color='green', dash='dash')))
-                
-            # Interpolated line
-            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
-            y_grid = np.interp(x_grid, comp['knots'], vals)
-            fig_comp.add_trace(go.Scatter(x=x_grid, y=y_grid, mode='lines', name='Fitted (Interp)', line=dict(color='blue', width=1), opacity=0.5))
             
-            fig_comp.update_layout(title=f"Component: {comp['name']}", xaxis_title=comp['x1_var'], yaxis_title='Value')
+            fig_comp.update_layout(title=f"{comp['name']}", xaxis_title=comp['x1_var'], yaxis_title='Value',
+                                   legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.5)'))
+            fig_comp.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+            fig_comp.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
             figures[f"Component: {comp['name']}"] = fig_comp
             
         elif comp['type'] == 'DIM_2':
@@ -2979,10 +3069,13 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
                         y_act = grid_act[:, i]
                         y_mod = grid_mod[:, i]
                         
-                    fig.add_trace(go.Scatter(x=x_knots, y=y_act, mode='lines+markers', name='Weighted Actual', line=dict(color='red', dash='dash'), showlegend=(i==0)), row=row, col=col)
-                    fig.add_trace(go.Scatter(x=x_knots, y=y_mod, mode='lines+markers', name='Weighted Model', line=dict(color='green', dash='dash'), showlegend=(i==0)), row=row, col=col)
+                    fig.add_trace(go.Scatter(x=x_knots, y=y_act, mode='lines+markers', name='Actual', line=dict(color='red'), showlegend=(i==0)), row=row, col=col)
+                    fig.add_trace(go.Scatter(x=x_knots, y=y_mod, mode='lines+markers', name='Model', line=dict(color='green'), showlegend=(i==0)), row=row, col=col)
                     
-                fig.update_layout(height=300*n_rows, title=f"Performance: {comp['name']} (By {slices_dim_name})")
+                fig.update_layout(height=300*n_rows, title=f"{comp['name']} (By {slices_dim_name})",
+                                  legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.5)'))
+                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
+                fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGrey', griddash='dot')
                 return fig
 
             # 1. Slices along X2 (Fixed X1)
@@ -3004,7 +3097,7 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
                 fig_hm.add_trace(go.Heatmap(z=t_grid, x=comp['knots_x2'], y=comp['knots_x1'], colorscale='Viridis'), row=1, col=2)
             else:
                 fig_hm = go.Figure(data=go.Heatmap(z=grid, x=comp['knots_x2'], y=comp['knots_x1'], colorscale='Viridis'))
-                fig_hm.update_layout(title=f"Component: {comp['name']} (Fitted)")
+                fig_hm.update_layout(title=f"{comp['name']} (Fitted)")
                 
             figures[f"Component: {comp['name']}"] = fig_hm
     

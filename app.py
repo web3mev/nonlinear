@@ -787,7 +787,7 @@ if 'params_df' in st.session_state:
         # Helper to display figure based on type
         def display_figure(fig):
             if hasattr(fig, 'write_html'): # Plotly
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else: # Matplotlib
                 st.pyplot(fig)
                 

@@ -1,0 +1,129 @@
+:root {
+  --bg-color: #121212;
+  --text-color: #e0e0e0;
+  --panel-bg: rgba(30, 30, 30, 0.7);
+  --sidebar-bg: rgba(20, 20, 20, 0.85);
+  --border-color: rgba(255, 255, 255, 0.1);
+  --input-bg: #2c2c2c;
+  --input-border: #444;
+  --input-text: #eee;
+  --heading-color: #ffffff;
+  --tab-inactive: #aaa;
+  --tab-active-bg: rgba(255, 255, 255, 0.1);
+  --tab-active-text: #fff;
+  --scroll-track: #1e1e1e;
+  --scroll-thumb: #555;
+  --scroll-thumb-hover: #777;
+}
+
+[data-theme="light"] {
+  --bg-color: #f0f2f5;
+  --text-color: #333333;
+  --panel-bg: rgba(255, 255, 255, 0.6);
+  --sidebar-bg: rgba(255, 255, 255, 0.85);
+  --border-color: rgba(0, 0, 0, 0.1);
+  --input-bg: #ffffff;
+  --input-border: #ccc;
+  --input-text: #333;
+  --heading-color: #1a1a1a;
+  --tab-inactive: #666;
+  --tab-active-bg: rgba(0, 0, 0, 0.05);
+  --tab-active-text: #000;
+  --scroll-track: #e0e0e0;
+  --scroll-thumb: #bbb;
+  --scroll-thumb-hover: #999;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  margin: 0;
+  padding: 0;
+  transition: background-color 0.3s, color 0.3s;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+/* Glassmorphism Classes */
+.glass-panel {
+  background: var(--panel-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.glass-sidebar {
+  background: var(--sidebar-bg);
+  backdrop-filter: blur(15px);
+  -webkit-backdrop-filter: blur(15px);
+  border-right: 1px solid var(--border-color);
+  height: 100vh;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+/* Inputs and Selects */
+.Select-control,
+.form-control,
+.input-group-text {
+  background-color: var(--input-bg) !important;
+  border: 1px solid var(--input-border) !important;
+  color: var(--input-text) !important;
+}
+.Select-menu-outer {
+  background-color: var(--input-bg) !important;
+  border: 1px solid var(--input-border) !important;
+  color: var(--input-text) !important;
+}
+.Select-value-label {
+  color: var(--input-text) !important;
+}
+
+/* Headers */
+h1,h2,h3,h4,h5,h6 {
+  color: var(--heading-color);
+  font-weight: 600;
+}
+
+/* Buttons */
+.btn-primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border: none;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+.btn-primary:hover {
+  background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* Tabs */
+.nav-tabs .nav-link {
+  color: var(--tab-inactive);
+  border: none;
+  background: transparent;
+}
+.nav-tabs .nav-link.active {
+  color: var(--tab-active-text);
+  background: var(--tab-active-bg);
+  border-radius: 5px 5px 0 0;
+  border-bottom: 2px solid #764ba2;
+}
