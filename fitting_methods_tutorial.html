@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Fitting Methods & Algorithms Tutorial</title>
+    <style>
+      body {
+        font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 40px;
+        color: #333;
+      }
+      h1 {
+        color: #2c3e50;
+        border-bottom: 2px solid #eee;
+        padding-bottom: 10px;
+      }
+      h2 {
+        color: #34495e;
+        margin-top: 40px;
+        border-left: 5px solid #3498db;
+        padding-left: 10px;
+      }
+      h3 {
+        color: #7f8c8d;
+        margin-top: 30px;
+      }
+      .math-block {
+        background: #f9f9f9;
+        padding: 20px;
+        border-radius: 8px;
+        border: 1px solid #e0e0e0;
+        margin: 20px 0;
+        overflow-x: auto;
+      }
+      .note {
+        background: #e8f6f3;
+        padding: 15px;
+        border-radius: 5px;
+        border-left: 5px solid #1abc9c;
+        margin: 20px 0;
+      }
+      code {
+        background: #f4f4f4;
+        padding: 2px 5px;
+        border-radius: 3px;
+        font-family: "Consolas", monospace;
+        color: #e74c3c;
+      }
+      ul {
+        margin-bottom: 20px;
+      }
+      li {
+        margin-bottom: 10px;
+      }
+      .method-tag {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.8em;
+        font-weight: bold;
+        color: white;
+        margin-left: 10px;
+      }
+      .tag-grad {
+        background-color: #3498db;
+      }
+      .tag-global {
+        background-color: #9b59b6;
+      }
+      .tag-approx {
+        background-color: #f39c12;
+      }
+    </style>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']]
+      }
+    };
+    </script>
+    <script
+      id="MathJax-script"
+      async
+      src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
+    ></script>
+  </head>
+  <body>
+    <h1>Fitting Methods & Algorithms Tutorial</h1>
+    <p>
+      This guide explains the mathematical foundations of the fitting backends
+      available in the nonlinear fitting tool. Understanding these underlying
+      mechanics will help you choose the right tool for your data.
+    </p>
+
+    <h2>1. The General Problem</h2>
+    <p>
+      We aim to find a set of parameters $\theta$ (the risk factors) that
+      minimize the difference between our observed data $y$ and our model
+      predictions $\hat{y}$.
+    </p>
+    <div class="math-block">
+      $$ \min_{\theta} \mathcal{L}(y, \hat{y}(\theta)) + \lambda \cdot R(\theta)
+      $$
+    </div>
+    <p>Where:</p>
+    <ul>
+      <li>
+        $\mathcal{L}$ is the <strong>Loss Function</strong> (e.g., Squared
+        Error, Poisson Likelihood).
+      </li>
+      <li>$\hat{y}(\theta)$ is our nonlinear model prediction.</li>
+      <li>
+        $R(\theta)$ is a Regularization term (L1 or L2) to prevent overfitting.
+      </li>
+    </ul>
+
+    <h2>
+      2. Scipy Least Squares
+      <span class="method-tag tag-grad">Gradient-Based</span>
+    </h2>
+    <p>
+      This is the standard engine for regression problems assuming Gaussian
+      (Normal) errors.
+    </p>
+    <h3>Objective Function</h3>
+    <p>It minimizes the weighted sum of squared residuals:</p>
+    <div class="math-block">
+      $$ \min_{x} \frac{1}{2} \sum_{i=1}^{N} w_i \rho\left( (y_i -
+      \hat{y}_i(x))^2 \right) $$
+    </div>
+    <p>Where $\rho(z)$ is the loss function.</p>
+
+    <h3>Loss Functions (Robustness)</h3>
+    <p>
+      Standard Least Squares is sensitive to outliers because errors are
+      squared. <strong>Robust Loss</strong> functions reduce the impact of
+      outliers by changing $\rho(z)$:
+    </p>
+    <ul>
+      <li>
+        <strong>Linear (Default)</strong>: $\rho(z) = z$. Standard Least
+        Squares.
+      </li>
+      <li>
+        <strong>Huber</strong>: Quadratic for small errors, linear for large
+        errors. <br />
+        $$ \rho(z) = \begin{cases} z & z \le \delta^2 \\ 2\delta(\sqrt{z} -
+        \delta/2) & z > \delta^2 \end{cases} $$
+      </li>
+      <li>
+        <strong>Soft L1</strong>: Smooth approximation of L1 (Absolute Error).
+        $\rho(z) = 2(\sqrt{1+z} - 1)$.
+      </li>
+      <li>
+        <strong>Cauchy</strong>: Very robust, effectively ignores extreme
+        outliers. $\rho(z) = \ln(1+z)$.
+      </li>
+    </ul>
+
+    <h3>Algorithms</h3>
+    <ul>
+      <li>
+        <strong>TRF (Trust Region Reflective)</strong>: The recommended default.
+        Robust, handles bounds constraints well, and solves large sparse
+        problems efficiently.
+      </li>
+      <li>
+        <strong>Dogbox</strong>: Alternative trust-region algorithm strictly for
+        bound-constrained problems. Useful if TRF fails.
+      </li>
+      <li>
+        <strong>LM (Levenberg-Marquardt)</strong>: Standard method for
+        unconstrained problems. Very fast but <em>does not support bounds</em>.
+      </li>
+    </ul>
+
+    <h2>
+      3. Poisson Regression
+      <span class="method-tag tag-grad">Gradient-Based</span>
+    </h2>
+    <p>
+      Designed specifically for <strong>Count Data</strong> (integers $\ge 0$).
+      It assumes the data follows a Poisson distribution where Variance = Mean.
+    </p>
+    <h3>Objective Function</h3>
+    <p>
+      It minimizes the <strong>Negative Log-Likelihood</strong> (or Deviance):
+    </p>
+    <div class="math-block">
+      $$ \min_{\theta} \sum_{i=1}^{N} \left( \hat{y}_i(\theta) - y_i
+      \ln(\hat{y}_i(\theta)) \right) $$
+    </div>
+    <p><strong>Why use this?</strong></p>
+    <ul>
+      <li>It naturally handles the fact that counts cannot be negative.</li>
+      <li>
+        It correctly weights the data: smaller counts have smaller variance,
+        larger counts have larger variance.
+      </li>
+      <li>
+        Standard Least Squares treats a difference of 1 vs 2 the same as 1000 vs
+        1001, which is incorrect for count data. Poisson knows that 1 vs 2 is a
+        huge relative difference.
+      </li>
+    </ul>
+
+    <h2>
+      4. Scipy Minimize (General)
+      <span class="method-tag tag-grad">Gradient-Based</span>
+    </h2>
+    <p>General-purpose solvers for minimizing any scalar function.</p>
+    <h3>Algorithms</h3>
+    <ul>
+      <li>
+        <strong>L-BFGS-B</strong>: Limited-memory
+        Broyden–Fletcher–Goldfarb–Shanno (Bounds). A quasi-Newton method that
+        approximates the Hessian matrix. Very memory efficient and fast for
+        large problems with bounds.
+      </li>
+      <li>
+        <strong>SLSQP</strong>: Sequential Least Squares Programming. Excellent
+        for problems with <em>constraints</em> (e.g., Equality constraints), but
+        usually slower than L-BFGS-B for simple bound problems.
+      </li>
+      <li>
+        <strong>Trust-Constr</strong>: A modern solver for constrained
+        optimization. Very robust but can be computationally expensive.
+      </li>
+    </ul>
+
+    <h2>
+      5. Linearized Least Squares
+      <span class="method-tag tag-approx">Approximation</span>
+    </h2>
+    <p>
+      An extremely fast approximation that turns the non-linear problem into a
+      linear one.
+    </p>
+    <h3>The Math</h3>
+    <p>
+      Our model is $y = \exp(X\beta)$. Taking the log gives $\ln(y) = X\beta$.
+    </p>
+    <p>
+      Instead of optimizing the non-linear error $(y - e^{X\beta})^2$, we
+      optimize the linear error on the log scale:
+    </p>
+    <div class="math-block">$$ \min_{\beta} || X\beta - \ln(y) ||^2 $$</div>
+    <p>
+      <strong>Note:</strong> This is an <em>approximation</em>. Optimizing on
+      the log scale effectively weights small values much higher than large
+      values. To correct for this, we typically apply weights $w_i = y_i^2$,
+      converting it into an Iterative Reweighted Least Squares (IRLS) loop.
+    </p>
+
+    <h2>
+      6. Global Optimization
+      <span class="method-tag tag-global">Stochastic</span>
+    </h2>
+    <p>
+      Used when the gradient-based methods get stuck in "Local Minima" (valleys
+      that aren't the deepest point).
+    </p>
+    <h3>Differential Evolution</h3>
+    <p>
+      A genetic algorithm. It maintains a population of candidate solutions.
+    </p>
+    <ol>
+      <li>
+        **Mutation**: Creates new candidates by mixing vectors from the
+        population.
+      </li>
+      <li>**Crossover**: Combines the mutant with the existing candidate.</li>
+      <li>**Selection**: Survived if the new candidate has lower cost.</li>
+    </ol>
+    <p>
+      <strong>Pros:</strong> Can find the true global minimum. <br />
+      <strong>Cons:</strong> Very slow (requires thousands of function
+      evaluations).
+    </p>
+
+    <h3>Basinhopping</h3>
+    <p>A "Iterated Local Search" method.</p>
+    <ol>
+      <li>Run a local minimizer (like L-BFGS-B).</li>
+      <li>Randomly "hop" (perturb) the parameters to a new spot.</li>
+      <li>Run local minimizer again.</li>
+      <li>
+        Accept/Reject the new spot based on Metropolis criterion (Probability
+        $\propto e^{-\Delta E / T}$).
+      </li>
+    </ol>
+
+    <div class="note">
+      <strong>Summary Recommendation:</strong><br />
+      <ul>
+        <li>
+          <strong>Standard Data:</strong> Use
+          <code>Scipy Least Squares (TRF)</code>.
+        </li>
+        <li><strong>Count Data:</strong> Use <code>Poisson Loss</code>.</li>
+        <li>
+          <strong>Outliers present:</strong> Use
+          <code>Scipy Least Squares</code> with <code>Huber</code> or
+          <code>Soft L1</code> loss.
+        </li>
+        <li>
+          <strong>Getting stuck in bad solutions:</strong> Try
+          <code>Differential Evolution</code> to find good starting parameters,
+          then refine with <code>Scipy Least Squares</code>.
+        </li>
+      </ul>
+    </div>
+  </body>
+</html>

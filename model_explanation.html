@@ -13,6 +13,13 @@
         .MathJax { font-size: 110%; }
     </style>
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']]
+      }
+    };
+    </script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 </head>
 <body>
@@ -85,5 +92,54 @@ $$ v_i = v*{i-1} + \delta_i \quad \text{for } i=1 \dots n $$</p>
 <li><strong>Dec/Inc</strong>: Flip U-axis, apply Inc/Inc, flip back.</li>
 <li><strong>Dec/Dec</strong>: Flip both axes, apply Inc/Inc, flip back.</li>
 </ul>
+<h2>4. Performance Metrics</h2>
+<p>The following metrics are used to evaluate model performance:</p>
+<h3>R-squared ($R^2$)</h3>
+<p>The proportion of variance in the dependent variable explained by the model:</p>
+<p>$$ R^2 = 1 - \frac{\sum (y_i - \hat{y}_i)^2}{\sum (y_i - \bar{y})^2} $$</p>
+
+<h3>Pseudo R-squared (McFadden)</h3>
+<p>A measure of fit for non-linear models comparable to $R^2$. It compares the likelihood of the fitted model to a null model (intercept only).</p>
+<p>$$ R^2_{pseudo} = 1 - \frac{\ln(L_{model})}{\ln(L_{null})} \approx 1 - \frac{\chi^2_{model}}{\chi^2_{null}} $$</p>
+
+<h3>RMSE (Root Mean Square Error)</h3>
+<p>Standard deviation of the residuals:</p>
+<p>$$ RMSE = \sqrt{\frac{1}{N} \sum_{i=1}^{N} (y_i - \hat{y}_i)^2} $$</p>
+
+<h3>MAE (Mean Absolute Error)</h3>
+<p>Average magnitude of the errors:</p>
+<p>$$ MAE = \frac{1}{N} \sum_{i=1}^{N} |y_i - \hat{y}_i| $$</p>
+
+<h3>Gini Coefficient</h3>
+<p>A measure of the model's ability to rank risk. Derived from the Area Under the Lorenz Curve (AUC).</p>
+<p>$$ Gini = 2 \cdot AUC - 1 $$</p>
+
+<h3>Poisson Deviance</h3>
+<p>Goodness-of-fit statistic for Poisson regression:</p>
+<p>$$ D = 2 \sum_{i=1}^{N} \left[ y_i \ln\left(\frac{y_i}{\hat{y}_i}\right) - (y_i - \hat{y}_i) \right] $$</p>
+<h2>5. Performance Chart Logic (Distributed Weighting)</h2>
+<p>The "Weighted Actual" and "Weighted Model" charts are calculated by distributing every data point's weight to its adjacent knots, ensuring a robust representation even with sparse data.</p>
+
+<h3>1D Distribution Logic</h3>
+<p>For a data point $(x, y)$ with weight $w$, falling between knots $k_{i}$ and $k_{i+1}$:</p>
+<p>
+    $$ \alpha = \frac{x - k_i}{k_{i+1} - k_i} $$
+</p>
+<p>The point contributes to the weighted sum at both knots:</p>
+<ul>
+    <li>At $k_i$: contributes $(1-\alpha) \cdot w \cdot y$ to the numerator and $(1-\alpha) \cdot w$ to the denominator.</li>
+    <li>At $k_{i+1}$: contributes $\alpha \cdot w \cdot y$ to the numerator and $\alpha \cdot w$ to the denominator.</li>
+</ul>
+<p>The final plotted value at knot $k$ is:</p>
+<p>
+    $$ \text{Value}_k = \frac{\sum \text{Distributed Numerator}}{\sum \text{Distributed Denominator}} $$
+</p>
+
+<h3>2D Distribution Logic (Bilinear)</h3>
+<p>Similarly, for 2D charts, a point $(x_1, x_2)$ is distributed to the 4 corners of the cell it falls into ($k_{u,v}, k_{u+1,v}, k_{u,v+1}, k_{u+1,v+1}$).</p>
+<p>The weight is split based on the product of the linear weights in each dimension:</p>
+<p>
+    $$ w_{corner} = w_{total} \cdot (1-\alpha_1)(1-\alpha_2) \quad \text{(e.g., top-left)} $$
+</p>
 </body>
 </html>

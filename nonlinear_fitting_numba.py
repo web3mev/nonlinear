@@ -1194,7 +1194,8 @@ def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
     y_log = A @ P
     
     # Numexpr expression
-    res_data = ne.evaluate('(y_true - exp(y_log)) / w')
+    # Updated: res = w * (y_true - exp(y_log))
+    res_data = ne.evaluate('w * (y_true - exp(y_log))')
     
     if alpha > 0:
         l2_strength = alpha * (1.0 - l1_ratio)
@@ -1218,8 +1219,10 @@ def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
     
     y_pred = ne.evaluate('exp(y_log)')
     
-    # 2. Compute scale = -y_pred / w
-    scale = ne.evaluate('-y_pred / w')
+    # 2. Compute scale for d(res)/dx
+    # res = w * (y - y_pred)
+    # d(res)/dx = w * (-d(y_pred)/dx) = -w * y_pred * d(y_log)/dx
+    scale = ne.evaluate('-w * y_pred')
     
     # 3. Compute dP/dx = M (Sparse)
     M = get_parameter_jacobian_matrix(x, components, param_mapping, base_P)
@@ -1355,6 +1358,10 @@ def plot_fitting_results(P, components, data, y_true, true_values):
             plt.savefig(f"fit_plot_numba_{comp['name']}.png")
             plt.close()
 
+    # Residuals for plot:
+    # The optimization uses weighted residuals: res_opt = w * (y_true - y_pred)
+    # For plotting, it's often more intuitive to visualize unweighted residuals.
+    # If w is not all 1s, these plots will show unweighted residuals.
     residuals = y_true - y_pred
     
     plt.figure(figsize=(10, 6))
@@ -1569,7 +1576,8 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
         P = reconstruct_P(x, param_mapping, base_P)
         y_log = A @ P
         y_pred = np.exp(y_log)
-        res = (y_true - y_pred) / w
+        # res = w * (y - y_pred)
+        res = w * (y_true - y_pred)
         val = 0.5 * np.sum(res**2)
         
         # Add Regularization
@@ -1588,20 +1596,13 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
         P = reconstruct_P(x, param_mapping, base_P)
         y_log = A @ P
         y_pred = np.exp(y_log)
-        res = (y_true - y_pred) / w
+        # res = w * (y - y_pred)
+        res = w * (y_true - y_pred)
         
-        # dObj/dx = sum( res * d(res)/dx )
-        # d(res)/dx = -1/w * d(y_pred)/dx
-        # d(y_pred)/dx = y_pred * d(y_log)/dx
-        # d(y_log)/dx = A @ dP/dx
-        # But in 'direct' mode, dP/dx is just a selector matrix (subset of Identity)
-        # So d(y_log)/dx is just columns of A corresponding to active parameters.
-        
-        # Let's compute gradient efficiently
-        # grad = - (res / w) * y_pred * (A @ dP/dx)
-        #      = - (res * y_pred / w) @ A_active
-        
-        term = - (res * y_pred / w)
+        # dObj/dypred = -w * res
+        # dypred/dx = y_pred * d(y_log)/dx
+        # term = -w * res * y_pred
+        term = - (w * res * y_pred)
         
         # A is (n_samples, n_total_params)
         # We need to select columns of A that correspond to x
@@ -1733,7 +1734,23 @@ def fit_linearized_ls(x0, A, param_mapping, base_P, y_true, w, components, bound
     # Calculate cost on ORIGINAL scale for consistency
     P_final = reconstruct_P_numba(res.x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
     y_pred = np.exp(A @ P_final)
-    residuals = (y_true - y_pred) / w
+    # Correct residual for reporting/metrics (often we want just raw error, but metrics might use it)
+    # The user asked to update residual function from (y-y_pred)/w to (y-y_pred)*w
+    # But usually 'residuals' variable appearing here is generic.
+    # Let's check usage. 
+    # If this is for `calculate_metrics(y_true, y_pred, w, n_params)` below?
+    # No, it's just saved in `res` dict.
+    # Let's keep it consistent with the backend definition if possible, OR keep it physical (y-yp).
+    # But code uses `residuals` variable name often for "weighted residuals" in optimization context.
+    # However at the end of fit, usually we want physical residuals.
+    # Let's stick to the requested definition for optimization logic, 
+    # but for "residuals" output key, "raw_residuals" is better?
+    # The existing code had `residuals = (y_true - y_pred) / w`.
+    # This implies standardized residuals ($y - \hat{y}) / \sigma$.
+    # With new definition $w$ is a weight, not $\sigma$. 
+    # If $w$ comes from balance^t, higher balance -> higher weight -> more importance.
+    # So "weighted residual" should be $(y - \hat{y}) * w$.
+    residuals = (y_true - y_pred) * w
     cost = 0.5 * np.sum(residuals**2)
     
     # Attach cost to result object (lsq_linear returns .cost as objective value, which is different)
@@ -1828,7 +1845,7 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
     # Calculate Least Squares Cost for consistency
     P_final = reconstruct_P_numba(res.x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
     y_pred_final = np.exp(A @ P_final)
-    residuals = (y_true - y_pred_final) / w
+    residuals = (y_true - y_pred_final) * w
     res.cost = 0.5 * np.sum(residuals**2)
     
     return res
@@ -1877,7 +1894,8 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
             # exp(100) is ~2e43, which is plenty large for regression but safe for squaring
             y_pred = ne.evaluate("exp(where(y_log > 100, 100, y_log))")
             
-            res = ne.evaluate("(y_true - y_pred) / w", local_dict={'y_true': y_true, 'y_pred': y_pred, 'w': w})
+            # res = w * (y - y_pred)
+            res = ne.evaluate("w * (y_true - y_pred)", local_dict={'y_true': y_true, 'y_pred': y_pred, 'w': w})
             val = 0.5 * ne.evaluate("sum(res**2)", local_dict={'res': res})
             
             if not np.isfinite(val):
@@ -1890,8 +1908,8 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
                 val += l1_reg * np.sum(np.abs(x))
             
             # Gradient
-            # term = - (res * y_pred / w)
-            term = ne.evaluate("- (res * y_pred / w)", local_dict={'res': res, 'y_pred': y_pred, 'w': w})
+            # term = -w * res * y_pred
+            term = ne.evaluate("- (w * res * y_pred)", local_dict={'res': res, 'y_pred': y_pred, 'w': w})
             
             grad_P = A.T @ term
             grad_x = M.T @ grad_P
@@ -1911,7 +1929,7 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
             P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
             y_log = A @ P
             y_pred = ne.evaluate("exp(where(y_log > 100, 100, y_log))")
-            res = ne.evaluate("(y_true - y_pred) / w", local_dict={'y_true': y_true, 'y_pred': y_pred, 'w': w})
+            res = ne.evaluate("(y_true - y_pred) * w", local_dict={'y_true': y_true, 'y_pred': y_pred, 'w': w})
             val = 0.5 * ne.evaluate("sum(res**2)", local_dict={'res': res})
             
             if not np.isfinite(val):
@@ -2048,7 +2066,7 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
     P_final = reconstruct_P_numba(res.x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
     P_gpu = cp.array(P_final)
     y_pred_gpu = cp.exp(A_gpu @ P_gpu)
-    residuals_gpu = (y_true_gpu - y_pred_gpu) / w_gpu
+    residuals_gpu = (y_true_gpu - y_pred_gpu) * w_gpu
     cost_gpu = 0.5 * cp.sum(residuals_gpu**2)
     res.cost = float(cost_gpu)
     
@@ -2390,11 +2408,28 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     start_time = time.time()
     
     # Extract numpy arrays for fitting (Polars compatibility)
+    # Extract numpy arrays for fitting (Polars compatibility)
     y_true_arr = df_data['y'].to_numpy()
-    w_arr = df_data['w'].to_numpy()
     
     # Extract options
     options = options or {}
+    t_power = options.get('balance_power_t', 0.0)
+    
+    # Prepare weights
+    if 'balance' in df_data.columns:
+        balance_arr = df_data['balance'].to_numpy()
+        # Ensure positive
+        balance_arr = np.clip(balance_arr, 1e-6, None)
+        w_arr = balance_arr ** t_power
+    elif 'w' in df_data.columns:
+        w_arr = df_data['w'].to_numpy()
+    else:
+        w_arr = np.ones(len(df_data))
+    
+    # Also update w in df_data so it's consistent for other uses
+    # But df_data is Polars and might be large.
+    # We just use w_arr for fitting.
+
     n_starts = options.get('n_starts', 1)
     loss_function = options.get('loss', 'linear')
     
@@ -2677,7 +2712,7 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
         
         # Covariance = inv(H) * reduced_chisqr
         cov_x = np.linalg.inv(H) * red_chisqr
-        diag_cov = np.diag(cov_x)
+        diag_cov = np.diag(cov_x).copy() # Copy to ensure writable if view is read-only
         # Handle negative variance (numerical instability)
         diag_cov[diag_cov < 0] = 0
         stderr_x = np.sqrt(diag_cov)
@@ -3104,7 +3139,7 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
     return figures
 
 # --- Bootstrapping ---
-def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', options=None):
+def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', options=None, progress_callback=None):
     """
     Runs bootstrapping to estimate parameter uncertainty.
     """
@@ -3175,16 +3210,30 @@ def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', 
                     method=method,
                     x_scale='jac'
                 )
+            elif backend == 'scipy_min':
+                res = fit_scipy_minimize(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, method=method, options=options)
+                
             elif backend == 'linearized_ls':
                  res = fit_linearized_ls(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, bounds, param_mapping_numba)
-            # ... Add other backends if needed ...
+                 
+            elif backend == 'poisson_lbfgsb':
+                res = fit_poisson_lbfgsb(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, bounds, param_mapping_numba, options=options)
+                
+            elif backend == 'poisson_cupy':
+                res = fit_poisson_cupy(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, bounds, param_mapping_numba, options=options)
+                
+            elif backend == 'nlopt':
+                 res = fit_nlopt(x_curr, A_boot, param_mapping, base_P, y_boot, w_boot, components, bounds, param_mapping_numba, method=method, options=options)
+            
             else:
-                # Fallback or not supported yet for bootstrap
+                print(f"Bootstrap backend not supported: {backend}")
                 return None
                 
             if res and res.success:
                 return res.x
         except Exception as e:
+            # Print error to help debugging
+            print(f"Bootstrap iteration failed: {e}")
             return None
         return None
 
@@ -3200,6 +3249,9 @@ def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', 
             res = future.result()
             if res is not None:
                 valid_boots.append(res)
+            
+            if progress_callback:
+                progress_callback((i + 1) / n_boot, f"Bootstrap Iteration {i + 1}/{n_boot}")
                 
     if not valid_boots:
         print("Bootstrap failed: No valid runs.")
@@ -3233,7 +3285,8 @@ def fit_global_optimization(x0, A, param_mapping, base_P, y_true, w, components,
         P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
         y_log = A @ P
         y_pred = np.exp(y_log)
-        res = (y_true - y_pred) / w
+        # res = w * (y - y_pred)
+        res = w * (y_true - y_pred)
         val = 0.5 * np.sum(res**2)
         
         if l2_reg > 0: val += 0.5 * l2_reg * np.sum(x**2)
@@ -3309,7 +3362,7 @@ def load_model(filepath):
 # --- Cross-Validation ---
 from sklearn.model_selection import KFold
 
-def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy_ls', method='trf'):
+def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy_ls', method='trf', progress_callback=None):
     """
     Runs k-fold cross-validation to tune hyperparameters (L1/L2 reg).
     param_grid: list of dicts, e.g. [{'l1_reg': 0.1, 'l2_reg': 0.0}, ...]
@@ -3336,7 +3389,12 @@ def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy
     
     x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
     
-    for params in param_grid:
+    x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
+    
+    total_runs = len(param_grid)
+    for idx, params in enumerate(param_grid):
+        if progress_callback:
+            progress_callback(idx / total_runs, f"Grid Point {idx+1}/{total_runs}")
         l1 = params.get('l1_reg', 0.0)
         l2 = params.get('l2_reg', 0.0)
         
@@ -3375,12 +3433,31 @@ def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy
                         x_scale='jac'
                     )
                     if res.success: x_opt = res.x
-                # ... Add other backends ...
+                    
+                elif backend == 'scipy_min':
+                    res = fit_scipy_minimize(x0, A_train, param_mapping, base_P, y_train, w_train, components, method=method, options={'l1_reg': l1, 'l2_reg': l2})
+                    if res.success: x_opt = res.x
+                    
+                elif backend == 'linearized_ls':
+                     res = fit_linearized_ls(x0, A_train, param_mapping, base_P, y_train, w_train, components, bounds, param_mapping_numba)
+                     if res.success: x_opt = res.x
+                     
+                elif backend == 'poisson_lbfgsb':
+                    res = fit_poisson_lbfgsb(x0, A_train, param_mapping, base_P, y_train, w_train, components, bounds, param_mapping_numba, options={'l1_reg': l1, 'l2_reg': l2})
+                    if res.success: x_opt = res.x
+                    
+                elif backend == 'poisson_cupy':
+                    res = fit_poisson_cupy(x0, A_train, param_mapping, base_P, y_train, w_train, components, bounds, param_mapping_numba, options={'l1_reg': l1, 'l2_reg': l2})
+                    if res.success: x_opt = res.x
+                    
+                elif backend == 'nlopt':
+                     res = fit_nlopt(x0, A_train, param_mapping, base_P, y_train, w_train, components, bounds, param_mapping_numba, method=method, options={'l1_reg': l1, 'l2_reg': l2})
+                     if res.success: x_opt = res.x
+                
                 else:
-                    # Fallback to scipy_ls for CV for now as it's standard
-                    # Or implement others.
-                    pass
-            except:
+                    print(f"CV backend not supported: {backend}")
+            except Exception as e:
+                print(f"CV fold failed: {e}")
                 pass
                 
             if x_opt is not None:
@@ -3406,7 +3483,7 @@ def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy
 import emcee
 import corner
 
-def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method='trf', options=None):
+def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method='trf', options=None, progress_callback=None):
     """
     Runs MCMC using emcee to sample from the posterior distribution.
     """
@@ -3426,6 +3503,13 @@ def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method=
     x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
     
     ndim = len(x0)
+    
+    # Validation for walkers
+    if n_walkers < 2 * ndim:
+        print(f"Warning: n_walkers ({n_walkers}) is less than 2 * ndim ({2*ndim}). Increasing walkers to {2*ndim + 2} for stability.")
+        n_walkers = 2 * ndim + 2
+        
+    print(f"MCMC: {ndim} parameters, {n_walkers} walkers.")
     
     # Unpack Numba mapping
     (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
@@ -3448,15 +3532,24 @@ def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method=
         # reconstruct_P_numba is jitted, so it's fast.
         P = reconstruct_P_numba(theta, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
         y_log = A @ P
+        
+        # Stability clip for exp
+        y_log = np.clip(y_log, -100, 100)
         y_pred = np.exp(y_log)
         
         # Gaussian likelihood
         # sigma = 1/sqrt(w) -> w = 1/sigma^2
         # log L = -0.5 * sum( (y - y_pred)^2 * w )
-        # Ignoring constant terms
-        res = (y_true - y_pred)
-        ll = -0.5 * np.sum(res**2 * w)
-        return ll
+        
+        # Robust log-likelihood to avoid inf
+        try:
+            res_sq = (y_true - y_pred)**2
+            ll = -0.5 * np.sum(res_sq * w)
+            if np.isnan(ll):
+                return -np.inf
+            return ll
+        except:
+            return -np.inf
 
     # Log Probability
     def log_probability(theta):
@@ -3467,19 +3560,42 @@ def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method=
 
     # Initialize walkers
     # Start around x0 with small perturbation
-    pos = x0 + 1e-4 * np.random.randn(n_walkers, ndim)
+    # Initialize walkers
+    # Start around x0 with small perturbation using scaled jitter
+    # We use a larger jitter (1e-2) to ensure independence.
+    jitter = 1e-2 * (1 + np.abs(x0))
+    pos = x0 + jitter * np.random.randn(n_walkers, ndim)
     
-    # Check if pos is within bounds
+    # Handle bounds by reflecting back into domain
+    # This prevents 'clipping' which creates identical walkers (linear dependence)
     if bounds:
         lb, ub = bounds
-        # Clip to bounds
-        pos = np.clip(pos, lb + 1e-5, ub - 1e-5)
+        for i in range(ndim):
+            # Reflect below lower bound
+            under = pos[:, i] < lb[i]
+            if np.any(under):
+                # Reflect: lb + (lb - val) = 2*lb - val
+                # But if that exceeds ub, we just random uni.
+                pos[under, i] = lb[i] + np.random.uniform(1e-5, 1e-4, size=np.sum(under))
+            
+            # Reflect above upper bound
+            over = pos[:, i] > ub[i]
+            if np.any(over):
+                pos[over, i] = ub[i] - np.random.uniform(1e-5, 1e-4, size=np.sum(over))
+                
+        # Final safety clip (should be redundant but safe)
+        pos = np.clip(pos, lb + 1e-8, ub - 1e-8)
         
     # Run MCMC
     sampler = emcee.EnsembleSampler(n_walkers, ndim, log_probability)
     
     # Run
-    sampler.run_mcmc(pos, n_steps, progress=True)
+    # sampler.run_mcmc(pos, n_steps, progress=True)
+    for i, _ in enumerate(sampler.sample(pos, iterations=n_steps, progress=False)):
+        if progress_callback:
+            # Update every 10 steps to reduce overhead
+            if (i + 1) % 10 == 0:
+                progress_callback((i + 1) / n_steps, f"MCMC Step {i + 1}/{n_steps}")
     
     # Get samples
     # Discard burn-in (e.g. first 20%)

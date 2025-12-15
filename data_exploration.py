@@ -177,3 +177,74 @@ def plot_correlation_matrix(df):
     ax.set_title("Correlation Matrix")
     fig.tight_layout()
     return fig
+
+def generate_model_advice(df, dependent_var='y'):
+    """
+    Generate advice on model selection based on data properties.
+    """
+    advice_list = []
+    
+    # Check if dependent variable exists
+    if dependent_var not in df.columns:
+        return ["Dependent variable columns not found."]
+        
+    y_series = df[dependent_var]
+    y_data = y_series.drop_nulls().to_numpy()
+    
+    if len(y_data) == 0:
+        return ["No data available."]
+        
+    # 1. Check Data Type & Range
+    is_integer = False
+    if y_series.dtype in [pl.Int32, pl.Int64]:
+        is_integer = True
+    elif np.all(np.equal(np.mod(y_data, 1), 0)):
+        is_integer = True
+        
+    min_val = np.min(y_data)
+    max_val = np.max(y_data)
+    unique_vals = np.unique(y_data)
+    n_unique = len(unique_vals)
+    
+    # A. Binary Classification
+    if n_unique == 2 and set(unique_vals).issubset({0, 1}):
+        advice_list.append("**Binary Classification**: The target variable is binary (0/1). Consider using **Logistic Regression** or a model with a Sigmoid output.")
+        
+    # B. Count Data (Poisson)
+    elif is_integer and min_val >= 0:
+        advice_list.append("**Count Data**: The target variable consists of non-negative integers. This suggests a **Poisson** or **Negative Binomial** distribution might be appropriate.")
+        if np.var(y_data) > np.mean(y_data):
+            advice_list.append("  - **Note**: Variance is greater than Mean (Overdispersion). Negative Binomial might fit better than pure Poisson.")
+        advice_list.append("  - **Recommended Loss**: Poisson Loss.")
+            
+    # C. Continuous Positive Data (Gamma/LogNormal)
+    elif min_val > 0:
+        advice_list.append("**Positive Continuous Data**: All values are positive. Consider **Gamma** or **Log-Normal** distributions if the data is skewed.")
+        
+    # 2. Distribution Check
+    skewness = stats.skew(y_data)
+    kurt = stats.kurtosis(y_data)
+    
+    if abs(skewness) > 1:
+        advice_list.append(f"**Skewed Data**: The data is highly skewed (skew={skewness:.2f}).")
+        if min_val > 0:
+             advice_list.append("  - Consider fitting `log(y)` or using a Log link function.")
+    
+    # 3. Outliers (Kurtosis)
+    if kurt > 3:
+        advice_list.append(f"**Heavy Tails**: High kurtosis ({kurt:.2f}) indicates potential outliers.")
+        advice_list.append("  - **Recommended Loss**: Consider **Robust Loss** functions (e.g., Huber, Cauchy, Soft L1) to reduce the influence of outliers.")
+        
+    # 4. Zero Inflation
+    if min_val == 0:
+        n_zeros = np.sum(y_data == 0)
+        pct_zero = (n_zeros / len(y_data)) * 100
+        if pct_zero > 10:
+             advice_list.append(f"**Zero Inflation**: {pct_zero:.1f}% of values are zero.")
+             if is_integer:
+                 advice_list.append("  - If this is count data, consider Zero-Inflated Poisson models.")
+    
+    if not advice_list:
+        advice_list.append("**Normal Distribution**: Data appears well-behaved. Standard Least Squares (Gaussian) should work well.")
+        
+    return advice_list
