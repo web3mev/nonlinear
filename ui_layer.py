@@ -129,11 +129,25 @@ def render_sidebar():
     # 2. Data Configuration
     st.sidebar.header("Data Configuration")
     config['data_source'] = st.sidebar.radio("Data Source", ["Generate Data", "Load Data File"])
-    config['sample_size'] = st.sidebar.number_input("Sample Size", min_value=1000, value=100000, step=10000)
     
     config['data_file'] = None
-    if config['data_source'] == "Load Data File":
+    config['sampling_ratio'] = 1.0
+    # Default sample size for generation
+    config['sample_size'] = 100000 
+    
+    if config['data_source'] == "Generate Data":
+        config['sample_size'] = st.sidebar.number_input("Sample Size", min_value=1000, value=100000, step=10000)
+    else:
+        # Load Data File
         config['data_file'] = st.sidebar.file_uploader("Upload Data File", type=["csv", "parquet"])
+        config['sampling_ratio'] = st.sidebar.slider(
+            "Sampling Ratio", 
+            min_value=0.0, 
+            max_value=1.0, 
+            value=1.0, 
+            step=0.01,
+            help="Fraction of data to load (0.0 to 1.0)"
+        )
         
     st.sidebar.markdown("---")
     
@@ -177,158 +191,7 @@ def render_sidebar():
     # 4. Appearance
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Appearance")
-    dark_mode = st.sidebar.toggle("Dark Mode", value=True)
-    
-    if dark_mode:
-        theme_css = """
-        <style>
-            :root {
-                --primary-color: #ff4b4b;
-                --background-color: #0e1117;
-                --secondary-background-color: #262730;
-                --text-color: #fafafa;
-            }
-            .stApp {
-                background-color: #0e1117;
-                color: #fafafa;
-            }
-            .stSidebar {
-                background-color: #262730;
-            }
-        </style>
-        """
-    else:
-        theme_css = """
-        <style>
-            :root {
-                --primary-color: #ff4b4b !important;
-                --background-color: #ffffff !important;
-                --secondary-background-color: #f0f2f6 !important;
-                --text-color: #31333f !important;
-                --font: sans-serif;
-            }
-            .stApp {
-                background-color: #ffffff !important;
-                color: #31333f !important;
-            }
-            .stSidebar {
-                background-color: #f0f2f6 !important;
-            }
-            p, h1, h2, h3, h4, h5, h6, span, div, label, li, a {
-                color: #31333f !important;
-            }
-            
-            /* Inputs */
-            .stTextInput > div > div > input, 
-            .stNumberInput > div > div > input,
-            textarea {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-                caret-color: #31333f !important;
-            }
-            
-            /* Selectbox / Dropdown Main Box */
-            .stSelectbox > div > div > div {
-                 color: #31333f !important;
-                 background-color: #ffffff !important;
-            }
-            
-            /* Dropdown Menu Options (Popover) */
-            div[data-baseweb="select"] > div,
-            div[data-baseweb="base-input"] > input,
-            div[data-baseweb="popover"] div, 
-            div[data-baseweb="menu"] div {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-            }
-            
-            /* Tables */
-            div[data-testid="stDataFrame"] div,
-            div[data-testid="stDataEditor"] div {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-            }
-            /* Table Header */
-            div[role="columnheader"] {
-                color: #31333f !important;
-                background-color: #f0f2f6 !important;
-            }
-            
-            /* Expander */
-            .streamlit-expanderHeader {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-            }
-            div[data-testid="stExpander"] {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-                border-color: #d6d6d6 !important;
-            }
-            div[data-testid="stExpander"] > details > summary {
-                color: #31333f !important;
-                background-color: #f0f2f6 !important;
-            }
-            div[data-testid="stExpander"] > details > div {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-            }
-            
-            /* Buttons */
-            div.stButton > button {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-                border: 1px solid #d6d6d6 !important;
-            }
-            div.stButton > button:hover {
-                background-color: #f0f2f6 !important;
-                border-color: #ff4b4b !important;
-                color: #ff4b4b !important;
-            }
-            
-            /* File Uploader */
-            div[data-testid="stFileUploader"] {
-                color: #31333f !important;
-            }
-            div[data-testid="stFileUploader"] section {
-                background-color: #f0f2f6 !important; /* Light grey upload area */
-            }
-            div[data-testid="stFileUploader"] button {
-                color: #31333f !important;
-                background-color: #ffffff !important;
-                border: 1px solid #d6d6d6 !important;
-            }
-            
-            /* Progress Bar */
-            .stProgress > div > div > div > div {
-                background-color: #ff4b4b !important;
-            }
-            
-            /* Success/Error/Warning/Info Boxes - Text Color Force */
-            div[data-baseweb="notification"] p,
-            div[data-baseweb="notification"] div {
-                color: #31333f !important;
-            }
-            
-            /* Code Blocks (Fit Statistics) */
-            .stCodeBlock, 
-            .stCodeBlock > div, 
-            .stCodeBlock pre, 
-            .stCodeBlock code {
-                background-color: #f0f2f6 !important;
-                color: #31333f !important;
-            }
-            
-            /* Tables - Stronger Override */
-            div[data-testid="stDataFrame"] * {
-                color: #31333f !important;
-            }
-            div[data-testid="stDataFrame"] div[role="columnheader"] {
-                background-color: #e0e2e6 !important;
-            }
-            
-        </style>
-        """
-    st.markdown(theme_css, unsafe_allow_html=True)
+
     
     return config
 
@@ -531,7 +394,11 @@ def render_fitting_control(config):
                                 raise ValueError("No data loaded.")
                         else:
                             status_text.text(f"Generating {config['sample_size']} rows...")
-                            df_data, true_values = nlf.generate_data(components, n_samples=config['sample_size'])
+                            df_data, true_values = nlf.generate_data(
+                                components, 
+                                n_samples=config['sample_size'],
+                                t=config.get('balance_power_t', 1.0)
+                            )
                             df_data.write_parquet("generated_data.parquet")
                             st.session_state.fitting_data = df_data
 
@@ -630,6 +497,18 @@ def render_results():
             if 'report' in results:
                 st.markdown("### Fit Statistics")
                 st.code(results['report'], language='text')
+            
+            # Automated Analysis
+            if 'residuals' in results and 'fitting_data' in st.session_state:
+                analysis_text, suggestions = nlf.generate_fit_analysis(results, st.session_state.fitting_data)
+                
+                st.markdown("### Automated Analysis")
+                for line in analysis_text:
+                    st.markdown(line)
+                
+                if suggestions:
+                    st.warning("**Suggestions for Improvement:**\n\n" + "\n".join([f"- {s}" for s in suggestions]))
+                st.markdown("---")
                 
             if 'fitted_params' in results:
                 with st.expander("Fitted Parameters Table"):
@@ -652,7 +531,7 @@ def render_results():
             for i, (name, fig) in enumerate(comp_figs.items()):
                 with cols[i % 4]: display_figure(fig)
 
-            st.subheader("Performance Charts (Weighted Actual vs Model)")
+            st.subheader("Performance Charts")
             perf_figs = {k: v for k, v in figures.items() if k.startswith("Performance:")}
             if perf_figs:
                 grouped_figs = {}
@@ -792,24 +671,16 @@ def render_advanced_features(config):
         if st.button("Run Bootstrap"):
             if 'fitting_results' in st.session_state and st.session_state.fitting_results:
                 results_for_boot = st.session_state.fitting_results
-                df_run = results_for_boot.get('data', st.session_state.fitting_data)
-                
-                if df_run is not None:
-                     start_async_task(
-                        'bootstrap', 
-                        nlf.run_bootstrap, 
-                        args=(n_boot, st.session_state.params_df, df_run),
-                        kwargs={
-                            'backend': config['selected_backend'],
-                            'method': config['selected_method'],
-                            'options': {'l1_reg': config['l1_reg'], 'l2_reg': config['l2_reg']}
-                        }
-                    )
-                else:
-                    st.error("No data available.")
+            if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+                start_async_task(
+                    'bootstrap', 
+                    nlf.run_bootstrap, 
+                    args=(n_boot, st.session_state.params_df, st.session_state.fitting_data),
+                    kwargs={'backend': config['selected_backend'], 'method': config['selected_method']}
+                )
             else:
-                st.warning("Please run a fit first.")
-
+                st.warning("No data loaded.")
+        
         # Handle Async Logic
         boot_res, boot_err = run_async_task('bootstrap', None, None, None, "Running Bootstrap...")
         
@@ -817,7 +688,7 @@ def render_advanced_features(config):
             st.error(f"Bootstrap failed: {boot_err}")
         elif boot_res is not None:
             st.success("Bootstrap completed.")
-            # ... (Display Stats Logic) ...
+            # Calculate stats
             x_mean = np.mean(boot_res, axis=0)
             x_std = np.std(boot_res, axis=0)
             x_p05 = np.percentile(boot_res, 5, axis=0)

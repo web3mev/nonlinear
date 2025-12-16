@@ -15,6 +15,18 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+COLORS = {
+    'darkblue': '#0C2B53',
+    'liteblue': '#009CDE',
+    'yellow':   '#E0BA4C',
+    'grey':     '#44546A',
+    'purple':   '#7030A0',
+    'darkblue2':'#002060', 
+    'green':    '#00B050',
+    'orange':   '#FFC000',
+    'darkred':  '#C00000'
+}
+
 # Conditional imports
 try:
     import nlopt
@@ -106,7 +118,11 @@ def load_model_spec(csv_path='parameters.csv', df=None):
     return components
 
 # --- 2. Data Generation ---
-def generate_data(components, n_samples=int(1e6), seed=42):
+def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
+    """
+    Generates synthetic data. 
+    w is derived as balance^t.
+    """
     rng = np.random.default_rng(seed)
     data = {}
     
@@ -265,9 +281,8 @@ def generate_data(components, n_samples=int(1e6), seed=42):
     # Derived parameters: mu=12.2, sigma=1.08
     balance = rng.lognormal(mean=12.2, sigma=1.08, size=n_samples)
     
-    # Derive w based on 1/sqrt(balance)
-    # This implies variance is proportional to 1/balance (higher balance = more precision)
-    w = 1.0 / np.sqrt(balance)
+    # Derive w based on balance^t
+    w = np.power(balance, t)
     
     # Calculate clean y (no noise yet)
     # Shift y_log to have mean around log(0.01) ~ -4.6
@@ -2205,19 +2220,36 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             
             # Plot Weighted Actuals
             stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'], data)
-            ax.plot(stats_act['x'], stats_act['y_mean'], 'rs--', label='Weighted Actual', alpha=0.7)
+            ax.plot(stats_act['x'], stats_act['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9, markersize=4)
             
             # Plot Weighted Model
             stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'], data)
-            ax.plot(stats_mod['x'], stats_mod['y_mean'], 'gs--', label='Weighted Model', alpha=0.7)
+            ax.plot(stats_mod['x'], stats_mod['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9, markersize=4)
             
             # Count bins with data
             n_bins_with_data = stats_act['y_mean'].notna().sum()
+            
+            # Secondary Axis (Balance)
+            ax2 = ax.twinx()
+            if 'balance' in data.columns:
+                df_temp = data.select([comp['x1_var'], 'balance']).to_pandas()
+                ks = comp['knots']
+                if len(ks) > 1:
+                     idx = np.abs(df_temp[comp['x1_var']].values[:, None] - ks[None, :]).argmin(axis=1)
+                     bal_sums = np.zeros(len(ks))
+                     np.add.at(bal_sums, idx, df_temp['balance'].values)
+                     ax2.plot(ks, bal_sums, color=COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
+            
             ax.set_title(f"Performance: {comp['name']} ({len(comp['knots'])} knots, {n_bins_with_data} bins with data)")
             ax.set_xlabel(comp['x1_var'])
             ax.set_ylabel('Response')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            
+            # Combine legends
+            lines, labels = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax2.legend(lines + lines2, labels + labels2, loc='best')
+            
+            ax.grid(True, alpha=0.3, linestyle=':')
             figures[f"Performance: {comp['name']}"] = fig_perf
             
             # --- Component Plot (Restored) ---
@@ -2248,7 +2280,7 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             )
             
             # Helper to create subplot grid - REIMPLEMENTED for OO
-            def create_slice_grid_oo(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis):
+            def create_slice_grid_oo(slices_dim_name, x_axis_name, x_knots, slice_knots, grid_act, grid_mod, slice_axis, df_data, weights_arr):
                 n_slices = len(slice_knots)
                 n_cols = 3
                 n_rows = int(np.ceil(n_slices / n_cols))
@@ -2257,6 +2289,14 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 axes = fig.subplots(n_rows, n_cols)
                 axes = np.atleast_1d(axes).flatten()
                 
+                # Precompute balance grid if possible
+                grid_bal = None
+                if 'balance' in df_data.columns:
+                     # We can reuse get_centered_weighted_stats_2d but passing 'balance' as y? 
+                     # Actually no, we want sum. The helper computes mean.
+                     # Let's do a custom binning for balance sum here or inside loop
+                     pass
+
                 for i in range(n_slices):
                     ax = axes[i]
                     slice_val = slice_knots[i]
@@ -2269,9 +2309,46 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                         y_act = grid_act[:, i]
                         y_mod = grid_mod[:, i]
                         
+                    # Calculate Balance for this slice (approximate/binning)
+                    bal_line = None
+                    if 'balance' in df_data.columns:
+                        # 1. Filter data near slice
+                        # This is expensive inside loop but robust
+                        d_col = df_data.select([comp['x1_var'], comp['x2_var'], 'balance']).to_pandas()
+                        
+                        # Identify points belonging to this slice
+                        # slice_axis=0 => slice variable is x1_var (first arg in helper)
+                        # slice_axis=1 => slice variable is x2_var
+                        k_slice = comp['knots_x1'] if slice_axis==0 else comp['knots_x2']
+                        k_plot = comp['knots_x2'] if slice_axis==0 else comp['knots_x1']
+                        v_slice = d_col[comp['x1_var']].values if slice_axis==0 else d_col[comp['x2_var']].values
+                        v_plot = d_col[comp['x2_var']].values if slice_axis==0 else d_col[comp['x1_var']].values
+                        
+                        # Find indices for this slice
+                        if len(k_slice) > 1:
+                            idx_slice = np.abs(v_slice[:, None] - k_slice[None, :]).argmin(axis=1)
+                            mask = (idx_slice == i)
+                        else:
+                            mask = np.ones(len(v_slice), dtype=bool)
+                            
+                        # Sum balance for plotting axis
+                        if len(k_plot) > 1:
+                             idx_plot = np.abs(v_plot[mask][:, None] - k_plot[None, :]).argmin(axis=1)
+                             bal_line = np.zeros(len(k_plot))
+                             np.add.at(bal_line, idx_plot, d_col.loc[mask, 'balance'].values)
+                    
+                    # Scaling Balance to Primary Axis
+                    if bal_line is not None and bal_line.max() > 0:
+                        # Scale to roughly max of y_act for visibility
+                        y_max_ref = np.nanmax(y_act) if not np.all(np.isnan(y_act)) else 1.0
+                        if y_max_ref == 0: y_max_ref = 1.0
+                        scale_factor = y_max_ref / bal_line.max()
+                        bal_scaled = bal_line * scale_factor
+                        ax.plot(x_knots, bal_scaled, color=COLORS['grey'], linestyle='--', label='Balance (Scaled)', alpha=0.5)
+
                     # Plot
-                    ax.plot(x_knots, y_act, 'rs--', label='Weighted Actual', alpha=0.7)
-                    ax.plot(x_knots, y_mod, 'gs--', label='Weighted Model', alpha=0.7)
+                    ax.plot(x_knots, y_act, color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9, markersize=4)
+                    ax.plot(x_knots, y_mod, color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9, markersize=4)
                     
                     # Count data points (non-nan)
                     n_data = np.sum(~np.isnan(y_act))
@@ -2280,11 +2357,15 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                     ax.set_xlabel(x_axis_name)
                     ax.set_ylabel('Response')
                     
-                    # Add legend to the first subplot that has data, or the first one if none have data
-                    if i == 0 or (n_data > 0 and len(ax.get_legend_handles_labels()[0]) > 0 and not ax.get_legend()):
-                         ax.legend()
+                    # Add legend
+                    # Only if we have data or it's the first plot
+                    if i == 0 or n_data > 0:
+                         # De-duplicate labels
+                         handles, labels = ax.get_legend_handles_labels()
+                         by_label = dict(zip(labels, handles))
+                         ax.legend(by_label.values(), by_label.keys(), loc='best', fontsize='small')
                          
-                    ax.grid(True, alpha=0.3)
+                    ax.grid(True, alpha=0.3, linestyle=':')
                     
                 # Hide unused subplots
                 for i in range(n_slices, len(axes)):
@@ -2300,7 +2381,9 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 slice_knots=comp['knots_x1'],
                 grid_act=grid_actual,
                 grid_mod=grid_model,
-                slice_axis=0
+                slice_axis=0,
+                df_data=data,
+                weights_arr=weights
             )
             fig1.suptitle(f"Performance: {comp['name']} (By {comp['x1_var']})", fontsize=16)
             figures[f"Performance: {comp['name']} (By {comp['x1_var']})"] = fig1
@@ -2313,7 +2396,9 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
                 slice_knots=comp['knots_x2'],
                 grid_act=grid_actual,
                 grid_mod=grid_model,
-                slice_axis=1
+                slice_axis=1,
+                df_data=data,
+                weights_arr=weights
             )
             fig2.suptitle(f"Performance: {comp['name']} (By {comp['x2_var']})", fontsize=16)
             figures[f"Performance: {comp['name']} (By {comp['x2_var']})"] = fig2
@@ -2373,6 +2458,50 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     figures['Q-Q Plot'] = fig
     
     return figures
+
+def generate_fit_analysis(results, df_data):
+    """
+    Generates automated analysis and suggestions based on fit results.
+    """
+    analysis = []
+    suggestions = []
+    
+    # 1. Convergence
+    if results.get('success', False):
+        analysis.append("✅ **Convergence**: The optimization algorithm converged successfully.")
+    else:
+        analysis.append("❌ **Convergence**: The optimization failed to converge. Check initial parameters or increase max iterations.")
+        suggestions.append("Try increasing `maxiter` or providing better initial guesses.")
+
+    # 2. Residual Analysis
+    if 'residuals' in results:
+        res = results['residuals']
+        
+        # Bias
+        mean_res = np.mean(res)
+        std_res = np.std(res)
+        analysis.append(f"ℹ️ **Bias**: Mean residual is {mean_res:.4g} (Std Dev: {std_res:.4g}).")
+        
+        if abs(mean_res) > 0.1 * std_res:
+            suggestions.append("⚠️ significant bias detected. The model might be systematically under/over-estimating.")
+            
+        # Normality (Skew/Kurtosis)
+        skew = scipy.stats.skew(res)
+        kurt = scipy.stats.kurtosis(res)
+        
+        analysis.append(f"ℹ️ **Normality**: Skewness={skew:.2f}, Kurtosis={kurt:.2f}.")
+        
+        if abs(skew) > 1.0:
+            suggestions.append("⚠️ Residuals are skewed. Consider using a different loss function (e.g., Tweedie) or checking for outliers.")
+        if kurt > 3.0:
+            suggestions.append("⚠️ High kurtosis (heavy tails). Outliers might be influencing the fit.")
+            
+    # 3. Cost
+    if 'cost' in results:
+        analysis.append(f"ℹ️ **Final Cost**: {results['cost']:.4g}")
+
+    return analysis, suggestions
+
 
 def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback=None, backend='scipy_ls', method='trf', options=None, stop_event=None, plotting_backend='matplotlib'):
     """
