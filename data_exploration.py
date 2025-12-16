@@ -2,6 +2,7 @@ import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+import warnings
 
 def analyze_distribution(data_series):
     """
@@ -59,8 +60,19 @@ def analyze_distribution(data_series):
     for name in dist_names:
         try:
             dist = getattr(stats, name)
-            # Fit parameters on downsampled data
-            params = dist.fit(fit_data)
+            
+            # Data validation for specific distributions
+            current_fit_data = fit_data
+            
+            # Lognorm/Gamma/Expon handle shifts (loc), but often unstable with 0s if not bounded.
+            # Pure lognorm requires x > 0. dist.fit tries to find loc.
+            # If we want to strictly fit positive domain distributions, we should be careful.
+            
+            # Suppress "invalid value in log" warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=RuntimeWarning)
+                # Fit parameters on downsampled data
+                params = dist.fit(current_fit_data)
             
             # Calculate PDF
             pdf_vals = dist.pdf(x_mid, *params)

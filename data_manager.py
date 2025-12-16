@@ -10,10 +10,13 @@ def load_and_process_data(config):
     if config['data_source'] == "Load Data File" and config['data_file']:
         try:
             # 1. Load File
-            if config['data_file'].name.endswith(".parquet"):
-                df_loaded = pl.read_parquet(config['data_file'])
+            file_obj = config['data_file']
+            filename = file_obj if isinstance(file_obj, str) else file_obj.name
+            
+            if filename.endswith(".parquet"):
+                df_loaded = pl.read_parquet(file_obj)
             else:
-                df_loaded = pl.read_csv(config['data_file'])
+                df_loaded = pl.read_csv(file_obj)
 
             # 2. Sampling
             sampling_ratio = config.get('sampling_ratio', 1.0)

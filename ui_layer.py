@@ -57,11 +57,19 @@ def render_sidebar():
     
     st.sidebar.header("Configuration")
     
-    uploaded_param_file = st.sidebar.file_uploader("Upload Parameter File", type=["csv"])
-    if uploaded_param_file:
-        config['param_file'] = uploaded_param_file
-    else:
-        config['param_file'] = "parameters.csv"
+    # uploaded_param_file = st.sidebar.file_uploader("Upload Parameter File", type=["csv"])
+    # if uploaded_param_file:
+    #    config['param_file'] = uploaded_param_file
+    # else:
+    
+    # Read in-place
+    st.sidebar.markdown("### Parameter File")
+    
+    param_files = glob.glob("*.csv")
+    if not param_files: param_files = ["parameters.csv"]
+    
+    # Assign directly to config['param_file']
+    config['param_file'] = st.sidebar.selectbox("Browse Parameters", param_files, index=0)
     
     if st.sidebar.button("Reload Parameters"):
         st.cache_data.clear()
@@ -161,8 +169,22 @@ def render_sidebar():
     if config['data_source'] == "Generate Data":
         config['sample_size'] = st.sidebar.number_input("Sample Size", min_value=1000, value=100000, step=10000)
     else:
-        # Load Data File
-        config['data_file'] = st.sidebar.file_uploader("Upload Data File", type=["csv", "parquet"])
+        # Load Data File (Read In-Place)
+        # Load Data File (Read In-Place)
+        
+        # File Browser Helper
+        data_files = glob.glob("*.csv") + glob.glob("*.parquet")
+        if not data_files:
+            data_files = ["No files found"]
+            
+        # Assign directly to config['data_file']
+        selected_file = st.sidebar.selectbox("Browse Files", data_files, index=0 if data_files else 0)
+        
+        if selected_file == "No files found":
+            config['data_file'] = None
+        else:
+            config['data_file'] = selected_file
+        
         config['sampling_ratio'] = st.sidebar.slider(
             "Sampling Ratio", 
             min_value=0.0, 
@@ -222,33 +244,22 @@ def render_input_section(param_file):
     """Renders the Input Data & Parameters section."""
     if 'params_df' in st.session_state:
         with st.expander("Input Data & Parameters", expanded=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("### Parameter")
-                column_config = {
-                    "RiskFactor_NM": st.column_config.TextColumn("Risk Factor"),
-                    "Sub_Model": st.column_config.TextColumn("Sub Model"),
-                    "RiskFactor": st.column_config.NumberColumn("Value", format="%.4f"),
-                    "On_Off": st.column_config.TextColumn("On/Off"),
-                    "Fixed": st.column_config.TextColumn("Fixed"),
-                    "Monotonicity": st.column_config.TextColumn("Monotonicity"),
-                }
-                edited_df = st.data_editor(
-                    st.session_state.params_df,
-                    column_config=column_config,
-                    width='content',
-                    height=400,
-                    key="data_editor"
-                )
-            
-            with c2:
-                st.markdown("### Data Preview")
-                if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
-                    st.dataframe(st.session_state.fitting_data.head(20), width='stretch', height=400)
-                elif 'fitting_results' in st.session_state and st.session_state.fitting_results is not None and 'data' in st.session_state.fitting_results:
-                     st.dataframe(st.session_state.fitting_results['data'].head(20), width='stretch', height=400)
-                else:
-                    st.info("No data available. Upload a file or run fitting to generate.")
+            st.markdown("### Parameter")
+            column_config = {
+                "RiskFactor_NM": st.column_config.TextColumn("Risk Factor"),
+                "Sub_Model": st.column_config.TextColumn("Sub Model"),
+                "RiskFactor": st.column_config.NumberColumn("Value", format="%.4f"),
+                "On_Off": st.column_config.TextColumn("On/Off"),
+                "Fixed": st.column_config.TextColumn("Fixed"),
+                "Monotonicity": st.column_config.TextColumn("Monotonicity"),
+            }
+            edited_df = st.data_editor(
+                st.session_state.params_df,
+                column_config=column_config,
+                width='stretch',
+                height=400,
+                key="data_editor"
+            )
 
             st.session_state.params_df = edited_df
 
@@ -262,6 +273,13 @@ def render_input_section(param_file):
 
 def render_exploration():
     """Renders the Data Exploration section."""
+    st.markdown("### Data Preview")
+    if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
+        st.dataframe(st.session_state.fitting_data.head(20), width='stretch', height=400)
+    elif 'fitting_results' in st.session_state and st.session_state.fitting_results is not None and 'data' in st.session_state.fitting_results:
+            st.dataframe(st.session_state.fitting_results['data'].head(20), width='stretch', height=400)
+    else:
+        st.info("No data available. Upload a file or run fitting to generate.")
     if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
         st.markdown("---")
         with st.expander("Data Exploration", expanded=True):

@@ -1760,6 +1760,17 @@ def fit_linearized_ls(x0, A, param_mapping, base_P, y_true, w, components, bound
     
     target = log_y - offset
     
+    # Scale by weights (w is passed as residual multiplier, so we multiply directly)
+    # A_prime rows and target elements are multiplied by w
+    # A_prime: (n_samples, n_params)
+    # w: (n_samples,)
+    
+    # Broadcast w column-wise
+    if w is not None:
+        # A_prime = A_prime * w[:, None] # No, w is 1D array
+         A_prime = A_prime * w.reshape(-1, 1)
+         target = target * w
+    
     # Bounds
     # scipy.optimize.lsq_linear expects bounds as (lb, ub)
     # Our bounds are in 'bounds' tuple (lb_array, ub_array)
@@ -1820,9 +1831,9 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
         
         y_pred = np.exp(y_log)
         
-        # Loss = sum(y_pred - y_true * y_log)
+        # Loss = sum(w * (y_pred - y_true * y_log))
         # Poisson loss (negative log likelihood up to constant)
-        loss = np.sum(y_pred - y_true * y_log)
+        loss = np.sum(w * (y_pred - y_true * y_log))
         
         # Add Regularization
         if l2_reg > 0:
@@ -1844,8 +1855,8 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
         y_log = np.where(y_log > 100, 100, y_log)
         y_pred = np.exp(y_log)
         
-        # dLoss/d(y_log) = y_pred - y_true
-        term = y_pred - y_true
+        # dLoss/d(y_log) = w * (y_pred - y_true)
+        term = w * (y_pred - y_true)
         
         # grad_P = A.T @ term
         grad_P = A.T @ term
@@ -2027,8 +2038,8 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         
         y_pred_gpu = cp.exp(y_log_gpu)
         
-        # Loss = sum(y_pred - y_true * y_log)
-        loss_gpu = cp.sum(y_pred_gpu - y_true_gpu * y_log_gpu)
+        # Loss = sum(w * (y_pred - y_true * y_log))
+        loss_gpu = cp.sum(w_gpu * (y_pred_gpu - y_true_gpu * y_log_gpu))
         
         # Add Regularization
         if l2_reg > 0:
@@ -2056,8 +2067,8 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         y_log_gpu = cp.where(y_log_gpu > 100, 100, y_log_gpu)
         y_pred_gpu = cp.exp(y_log_gpu)
         
-        # dLoss/d(y_log) = y_pred - y_true
-        term_gpu = y_pred_gpu - y_true_gpu
+        # dLoss/d(y_log) = w * (y_pred - y_true)
+        term_gpu = w_gpu * (y_pred_gpu - y_true_gpu)
         
         # grad_P = A.T @ term
         grad_P_gpu = A_gpu.T @ term_gpu
@@ -2837,15 +2848,23 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         balance_arr = df_data['balance'].to_numpy()
         # Ensure positive
         balance_arr = np.clip(balance_arr, 1e-6, None)
-        w_arr = balance_arr ** t_power
+        w_stat = balance_arr ** t_power
     elif 'w' in df_data.columns:
-        w_arr = df_data['w'].to_numpy()
+        w_stat = df_data['w'].to_numpy()
     else:
-        w_arr = np.ones(len(df_data))
+        w_stat = np.ones(len(df_data))
+        
+    # Standardize 'w_arr' passed to fit functions
+    # LS Backends expect 'w' to be the residual multiplier: res = w * (y-ym). Effective stats weight is w^2.
+    # Poisson Backends expect 'w' to be the stats weight: Sum w * Loss. Effective stats weight is w.
     
-    # Also update w in df_data so it's consistent for other uses
-    # But df_data is Polars and might be large.
-    # We just use w_arr for fitting.
+    ls_backends = ['scipy_ls', 'scipy_min', 'linearized_ls', 'nlopt', 'differential_evolution', 'basinhopping']
+    
+    if backend in ls_backends:
+        w_arr = np.sqrt(w_stat)
+    else:
+        # Poisson backends ('poisson_lbfgsb', 'poisson_cupy')
+        w_arr = w_stat
 
     n_starts = options.get('n_starts', 1)
     loss_function = options.get('loss', 'linear')
