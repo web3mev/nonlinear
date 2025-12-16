@@ -57,7 +57,7 @@ if df_loaded is not None:
 
 
 # --- 3. UI Sections (Tabs) ---
-tab1, tab2, tab3, tab4 = st.tabs(["Data & Exploration", "Model Specification", "Fitting & Results", "Advanced"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Data & Exploration", "Model Specification", "Fitting & Results", "Advanced", "Documentation"])
 
 with tab1:
     ui.render_exploration()
@@ -72,4 +72,7 @@ with tab3:
 
 with tab4:
     ui.render_advanced_features(config)
+
+with tab5:
+    ui.render_documentation()
 

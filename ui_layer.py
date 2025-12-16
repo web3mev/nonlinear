@@ -9,7 +9,30 @@ import nonlinear_fitting_numba as nlf
 import os
 import glob
 import time
+import streamlit.components.v1 as components
 import threading
+
+def render_documentation(tutorial_path="fitting_methods_tutorial.html", model_path="model_explanation.html"):
+    """Renders the documentation HTML files."""
+    st.markdown("---")
+    
+    t1, t2 = st.tabs(["Fitting Methods Tutorial", "Model Explanation"])
+    
+    with t1:
+        try:
+            with open(tutorial_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            components.html(html_content, height=800, scrolling=True)
+        except Exception as e:
+            st.error(f"Could not load tutorial: {e}")
+            
+    with t2:
+        try:
+            with open(model_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            components.html(html_content, height=800, scrolling=True)
+        except Exception as e:
+            st.error(f"Could not load model explanation: {e}")
 
 def get_next_version_filename(base_name="parameter_fitted"):
     files = glob.glob(f"{base_name}_v*.csv")

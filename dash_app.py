@@ -78,10 +78,25 @@ state = GlobalState()
 # --- Layout Components ---
 
 # Sidebar
+# Read Documentation Files
+try:
+    with open('fitting_methods_tutorial.html', 'r', encoding='utf-8') as f:
+        DOC_TUTORIAL = f.read()
+    with open('model_explanation.html', 'r', encoding='utf-8') as f:
+        DOC_MODEL = f.read()
+except Exception as e:
+    print(f"Warning: Could not read documentation files: {e}")
+    DOC_TUTORIAL = "<h1>Error loading tutorial</h1>"
+    DOC_MODEL = "<h1>Error loading model explanation</h1>"
+
 sidebar = html.Div(
     [
         html.H3("Nonlinear Fit", className="display-6"),
         html.Hr(),
+        
+        # Doc Button
+        dbc.Button("Documentation", id='btn-docs', color="info", outline=True, size="sm", className="w-100 mb-3"),
+        
         html.H5("Configuration", className="mt-3"),
         
         # File Upload
@@ -235,6 +250,32 @@ content = html.Div([
             dbc.ModalBody(html.Img(id='modal-img-display', style={'width': '100%'})),
         ],
         id="modal-enlarge",
+        size="xl",
+        is_open=False,
+    ),
+    
+    # Modal for Documentation
+    dbc.Modal(
+        [
+            dbc.ModalHeader(dbc.ModalTitle("Documentation"), close_button=True),
+            dbc.ModalBody(
+                dbc.Tabs([
+                    dbc.Tab(label="Fitting Tutorial", children=[
+                        html.Iframe(
+                            srcDoc=DOC_TUTORIAL,
+                            style={"width": "100%", "height": "70vh", "border": "none"}
+                        )
+                    ]),
+                    dbc.Tab(label="Model Logic", children=[
+                        html.Iframe(
+                            srcDoc=DOC_MODEL,
+                            style={"width": "100%", "height": "70vh", "border": "none"}
+                        )
+                    ])
+                ])
+            ),
+        ],
+        id="modal-docs",
         size="xl",
         is_open=False,
     ),
@@ -594,8 +635,48 @@ def render_tab_content(contents, active_tab, trigger_data, theme_is_light, plot_
     
     elif active_tab == "tab-results":
         if state.fitting_results is not None:
-             report = state.fitting_results.get('report', 'No report')
-             return status_msg, html.Pre(report)
+             results = state.fitting_results
+             
+             content_elements = []
+             
+             # 1. Suggestions (Alerts)
+             if 'suggestions' in results and results['suggestions']:
+                 content_elements.append(html.H5("Suggestions & Warnings", className="text-warning"))
+                 for sugg in results['suggestions']:
+                     content_elements.append(dbc.Alert(sugg, color="warning", is_open=True))
+             
+             # 2. Analysis Summary
+             if 'analysis' in results and results['analysis']:
+                 items = []
+                 for item in results['analysis']:
+                     color = "light"
+                     if "✅" in item: color = "success"
+                     if "❌" in item: color = "danger"
+                     if "⚠️" in item: color = "warning"
+                     if "ℹ️" in item: color = "info"
+                     
+                     items.append(dbc.ListGroupItem(dcc.Markdown(item, className="m-0"), color=color))
+                 
+                 content_elements.append(html.H5("Fit Analysis", className="mt-3"))
+                 content_elements.append(dbc.ListGroup(items, className="mb-3"))
+                 
+             # 3. Report
+             report = results.get('report', 'No report')
+             content_elements.append(html.H5("Detailed Fit Report", className="mt-3"))
+             
+             # Style for report based on theme
+             bg_color = '#f8f9fa' if theme_is_light else '#2b2b2b'
+             text_color = '#000000' if theme_is_light else '#e0e0e0'
+             
+             content_elements.append(html.Pre(report, style={
+                 'backgroundColor': bg_color, 
+                 'color': text_color,
+                 'padding': '15px', 
+                 'borderRadius': '5px',
+                 'border': f'1px solid {"#ddd" if theme_is_light else "#444"}'
+             }))
+             
+             return status_msg, html.Div(content_elements)
     return status_msg, html.Div("Select a tab.")
 
 
@@ -912,6 +993,18 @@ def monitor_benchmark(n_intervals, current_trigger, active_tab, theme_is_light):
         return f"Running... {state.benchmark_status}", state.benchmark_progress, True, dash.no_update, dash.no_update
         
     return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+# 8. Documentation Modal Toggle
+@app.callback(
+    Output('modal-docs', 'is_open'),
+    Input('btn-docs', 'n_clicks'),
+    State('modal-docs', 'is_open'),
+    prevent_initial_call=True
+)
+def toggle_docs(n, is_open):
+    if n:
+        return not is_open
+    return is_open
 
 # Interval for updates
 app.layout.children.append(dcc.Interval(id='interval-component', interval=500, n_intervals=0))

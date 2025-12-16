@@ -58,11 +58,22 @@ def configure_threading():
 def load_model_spec(csv_path='parameters.csv', df=None):
     if df is None:
         df = pd.read_csv(csv_path)
-    df = df[df['On_Off'] == 'Y'].copy()
+        
+    # We only fit parameters that are ON ('Y').
+    # However, for plotting, we might want to see bins for knots that are OFF.
+    # Strategy: Iterate through unique RiskFactors in the original DF.
+    # If a RiskFactor has ANY active rows, we include it.
     
     components = []
     
-    for rf_nm, group in df.groupby('RiskFactor_NM', sort=False):
+    # Group by RiskFactor_NM on the full DF to access all knots
+    for rf_nm, group_full in df.groupby('RiskFactor_NM', sort=False):
+        # Filter for active rows for FITTING structure
+        group = group_full[group_full['On_Off'] == 'Y'].copy()
+        
+        if len(group) == 0:
+            continue # Skip factors that are completely OFF
+            
         first_row = group.iloc[0]
         calc_type = first_row['Calc_Type']
         sub_model = first_row['Sub_Model']
@@ -81,6 +92,7 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             comp['fixed'] = group['Fixed'].iloc[0] == 'Y'
             comp['key'] = group['Key'].iloc[0]
             comp['n_params'] = 1
+            # Plot knots not really applicable for DIM_0 (scalar)
             
         elif calc_type == 'DIM_1':
             comp['knots'] = group['X1_Val'].values
@@ -89,7 +101,11 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             comp['keys'] = group['Key'].values
             comp['n_params'] = len(comp['knots'])
             
+            # Plotting Knots (All)
+            comp['plot_knots'] = group_full['X1_Val'].values
+            
         elif calc_type == 'DIM_2':
+            # Fitting Knots
             knots_x1 = sorted(group['X1_Val'].unique())
             knots_x2 = sorted(group['X2_Val'].unique())
             comp['knots_x1'] = np.array(knots_x1)
@@ -97,6 +113,10 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             comp['n_rows'] = len(knots_x1)
             comp['n_cols'] = len(knots_x2)
             comp['n_params'] = len(knots_x1) * len(knots_x2)
+            
+            # Plotting Knots (All)
+            comp['plot_knots_x1'] = np.array(sorted(group_full['X1_Val'].unique()))
+            comp['plot_knots_x2'] = np.array(sorted(group_full['X2_Val'].unique()))
             
             grid_values = np.zeros((len(knots_x1), len(knots_x2)))
             grid_fixed = np.zeros((len(knots_x1), len(knots_x2)), dtype=bool)
@@ -2218,12 +2238,15 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             fig_perf = Figure(figsize=(10, 6))
             ax = fig_perf.add_subplot(111)
             
+            # Use ALL knots for plotting binning if available, otherwise fallback to active knots
+            plot_knots = comp.get('plot_knots', comp['knots'])
+            
             # Plot Weighted Actuals
-            stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, comp['knots'], data)
+            stats_act = get_centered_weighted_stats(comp['x1_var'], y_true, weights, plot_knots, data)
             ax.plot(stats_act['x'], stats_act['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9, markersize=4)
             
             # Plot Weighted Model
-            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, comp['knots'], data)
+            stats_mod = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, plot_knots, data)
             ax.plot(stats_mod['x'], stats_mod['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9, markersize=4)
             
             # Count bins with data
@@ -2233,14 +2256,14 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax2 = ax.twinx()
             if 'balance' in data.columns:
                 df_temp = data.select([comp['x1_var'], 'balance']).to_pandas()
-                ks = comp['knots']
+                ks = plot_knots
                 if len(ks) > 1:
                      idx = np.abs(df_temp[comp['x1_var']].values[:, None] - ks[None, :]).argmin(axis=1)
                      bal_sums = np.zeros(len(ks))
                      np.add.at(bal_sums, idx, df_temp['balance'].values)
                      ax2.plot(ks, bal_sums, color=COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
             
-            ax.set_title(f"Performance: {comp['name']} ({len(comp['knots'])} knots, {n_bins_with_data} bins with data)")
+            ax.set_title(f"Performance: {comp['name']} ({len(plot_knots)} knots, {n_bins_with_data} bins with data)")
             ax.set_xlabel(comp['x1_var'])
             ax.set_ylabel('Response')
             
@@ -2257,12 +2280,13 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax = fig_comp.add_subplot(111)
             
             # Recalculate spline for component plot
-            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
+            x_grid = np.linspace(plot_knots.min(), plot_knots.max(), 100)
+            y_knots_plot = np.interp(plot_knots, comp['knots'], vals)
             y_grid = np.interp(x_grid, comp['knots'], vals)
             
-            ax.plot(comp['knots'], vals, 'ro-', label='Fitted')
+            ax.plot(plot_knots, y_knots_plot, 'ro-', label='Fitted')
             if t_vals is not None:
-                ax.plot(comp['knots'], t_vals, 'g--', label='True')
+                ax.plot(comp['knots'], t_vals, 'g--', label='True (Fit Knots)')
             
             ax.plot(x_grid, y_grid, 'b-', alpha=0.3)
             ax.set_title(f"{comp['name']}")
@@ -2270,13 +2294,58 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             figures[f"Component: {comp['name']}"] = fig_comp
             
         elif comp['type'] == 'DIM_2':
+            # Use ALL knots for plotting binning
+            plot_knots_x1 = comp.get('plot_knots_x1', comp['knots_x1'])
+            plot_knots_x2 = comp.get('plot_knots_x2', comp['knots_x2'])
+            
+            # --- 1. NEW: Marginal 1D Plots (Start) ---
+            # Marginal for Dimension 1 (X1)
+            fig_m1 = Figure(figsize=(10, 6))
+            ax_m1 = fig_m1.add_subplot(111)
+            
+            # Weighted stats along X1 (marginalizing X2)
+            stats_act_m1 = get_centered_weighted_stats(comp['x1_var'], y_true, weights, plot_knots_x1, data)
+            stats_mod_m1 = get_centered_weighted_stats(comp['x1_var'], y_pred, weights, plot_knots_x1, data)
+            
+            ax_m1.plot(stats_act_m1['x'], stats_act_m1['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9)
+            ax_m1.plot(stats_mod_m1['x'], stats_mod_m1['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9)
+            
+            ax_m1.set_title(f"Marginal Performance: {comp['name']} (By {comp['x1_var']})")
+            ax_m1.set_xlabel(comp['x1_var'])
+            ax_m1.set_ylabel('Response')
+            ax_m1.legend()
+            ax_m1.grid(True, alpha=0.3)
+            figures[f"Performance: {comp['name']} (Marginal {comp['x1_var']})"] = fig_m1
+            
+            # Marginal for Dimension 2 (X2)
+            fig_m2 = Figure(figsize=(10, 6))
+            ax_m2 = fig_m2.add_subplot(111)
+            
+            stats_act_m2 = get_centered_weighted_stats(comp['x2_var'], y_true, weights, plot_knots_x2, data)
+            stats_mod_m2 = get_centered_weighted_stats(comp['x2_var'], y_pred, weights, plot_knots_x2, data)
+            
+            ax_m2.plot(stats_act_m2['x'], stats_act_m2['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9)
+            ax_m2.plot(stats_mod_m2['x'], stats_mod_m2['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9)
+            
+            ax_m2.set_title(f"Marginal Performance: {comp['name']} (By {comp['x2_var']})")
+            ax_m2.set_xlabel(comp['x2_var'])
+            ax_m2.set_ylabel('Response')
+            ax_m2.legend()
+            ax_m2.grid(True, alpha=0.3)
+            figures[f"Performance: {comp['name']} (Marginal {comp['x2_var']})"] = fig_m2
+            
             # --- Performance Charts (Slices) ---
-            # Calculate Weighted Actual and Model Grids
+            # Calculate Weighted Actual and Model Grids using PLOT KNOTS (or fitted knots? Usually slices use fitted knots for structure, but binning should use plot knots??)
+            # Actually, slices depend on the knots defining the rows/cols.
+            # If we use plot_knots here, we get a bigger grid.
+            # Existing code for slices iterates over fixed values (knots).
+            # If we use plot_knots, we get Slices for "OFF" knots too. That is desired.
+            
             grid_actual = get_centered_weighted_stats_2d(
-                comp['x1_var'], comp['x2_var'], y_true, weights, comp['knots_x1'], comp['knots_x2'], data
+                comp['x1_var'], comp['x2_var'], y_true, weights, plot_knots_x1, plot_knots_x2, data
             )
             grid_model = get_centered_weighted_stats_2d(
-                comp['x1_var'], comp['x2_var'], y_pred, weights, comp['knots_x1'], comp['knots_x2'], data
+                comp['x1_var'], comp['x2_var'], y_pred, weights, plot_knots_x1, plot_knots_x2, data
             )
             
             # Helper to create subplot grid - REIMPLEMENTED for OO
@@ -2377,8 +2446,8 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             fig1 = create_slice_grid_oo(
                 slices_dim_name=comp['x1_var'],
                 x_axis_name=comp['x2_var'],
-                x_knots=comp['knots_x2'],
-                slice_knots=comp['knots_x1'],
+                x_knots=plot_knots_x2,
+                slice_knots=plot_knots_x1,
                 grid_act=grid_actual,
                 grid_mod=grid_model,
                 slice_axis=0,
@@ -2392,8 +2461,8 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             fig2 = create_slice_grid_oo(
                 slices_dim_name=comp['x2_var'],
                 x_axis_name=comp['x1_var'],
-                x_knots=comp['knots_x1'],
-                slice_knots=comp['knots_x2'],
+                x_knots=plot_knots_x1,
+                slice_knots=plot_knots_x2,
                 grid_act=grid_actual,
                 grid_mod=grid_model,
                 slice_axis=1,
@@ -2466,14 +2535,35 @@ def generate_fit_analysis(results, df_data):
     analysis = []
     suggestions = []
     
+    metrics = results.get('metrics', {})
+    
     # 1. Convergence
     if results.get('success', False):
         analysis.append("✅ **Convergence**: The optimization algorithm converged successfully.")
     else:
-        analysis.append("❌ **Convergence**: The optimization failed to converge. Check initial parameters or increase max iterations.")
-        suggestions.append("Try increasing `maxiter` or providing better initial guesses.")
+        analysis.append("❌ **Convergence**: The optimization failed to converge.")
+        suggestions.append("Try increasing `maxiter`, adjusting `ftol`/`gtol`, or providing better initial guesses.")
 
-    # 2. Residual Analysis
+    # 2. Fit Quality (R2, AIC, BIC)
+    r2 = metrics.get('r2', None)
+    if r2 is not None:
+        if r2 > 0.99:
+            analysis.append(f"✅ **Fit Quality**: Excellent fit (R² = {r2:.4f}).")
+        elif r2 > 0.90:
+             analysis.append(f"ℹ️ **Fit Quality**: Good fit (R² = {r2:.4f}).")
+        elif r2 > 0.70:
+             analysis.append(f"⚠️ **Fit Quality**: Moderate fit (R² = {r2:.4f}).")
+             suggestions.append("Model might be underfitting. Consider adding more knots or components.")
+        else:
+             analysis.append(f"❌ **Fit Quality**: Poor fit (R² = {r2:.4f}).")
+             suggestions.append("Check if the model structure is appropriate for the data.")
+
+    aic = metrics.get('aic', None)
+    bic = metrics.get('bic', None)
+    if aic is not None and bic is not None:
+        analysis.append(f"ℹ️ **Info Criteria**: AIC={aic:.2f}, BIC={bic:.2f}.")
+
+    # 3. Residual Analysis
     if 'residuals' in results:
         res = results['residuals']
         
@@ -2483,7 +2573,8 @@ def generate_fit_analysis(results, df_data):
         analysis.append(f"ℹ️ **Bias**: Mean residual is {mean_res:.4g} (Std Dev: {std_res:.4g}).")
         
         if abs(mean_res) > 0.1 * std_res:
-            suggestions.append("⚠️ significant bias detected. The model might be systematically under/over-estimating.")
+            analysis.append(f"⚠️ **Bias Warning**: Significant bias detected.")
+            suggestions.append("The model might be systematically under/over-estimating. Check for missing covariates or incorrect link function.")
             
         # Normality (Skew/Kurtosis)
         skew = scipy.stats.skew(res)
@@ -2492,11 +2583,11 @@ def generate_fit_analysis(results, df_data):
         analysis.append(f"ℹ️ **Normality**: Skewness={skew:.2f}, Kurtosis={kurt:.2f}.")
         
         if abs(skew) > 1.0:
-            suggestions.append("⚠️ Residuals are skewed. Consider using a different loss function (e.g., Tweedie) or checking for outliers.")
+            suggestions.append("⚠️ Residuals are skewed. Consider using a different loss function (e.g., Poisson/Tweedie) or transforming the target.")
         if kurt > 3.0:
-            suggestions.append("⚠️ High kurtosis (heavy tails). Outliers might be influencing the fit.")
-            
-    # 3. Cost
+            suggestions.append("⚠️ High kurtosis (heavy tails). Outliers might be influencing the fit. Consider using Robust Regression (L1 or Huber loss).")
+
+    # 4. Cost
     if 'cost' in results:
         analysis.append(f"ℹ️ **Final Cost**: {results['cost']:.4g}")
 
@@ -2692,24 +2783,15 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     if progress_callback: progress_callback(0.92, "Generating Fit Report...")
     report_str, report_metrics = generate_fit_report(res, res.x, A, param_mapping, base_P, y_true_arr, w_arr, param_mapping_numba, elapsed_time=elapsed)
 
-    # Calculate Metrics (Legacy / UI)
+    # Use report_metrics as base
+    metrics = report_metrics.copy()
+    metrics['n_samples'] = len(df_data)
+
+    # Re-calculate residuals for plots and analysis (match generate_fit_report logic if needed)
     y_log_pred = A @ P_final
     y_pred = np.exp(y_log_pred)
-    residuals = y_true_arr - y_pred
-    
-    ss_res = np.sum(residuals**2)
-    ss_tot = np.sum((y_true_arr - np.mean(y_true_arr))**2)
-    r2 = 1 - (ss_res / ss_tot)
-    rmse = np.sqrt(np.mean(residuals**2))
-    mae = np.mean(np.abs(residuals))
-    
-    metrics = {
-        'R2': r2,
-        'RMSE': rmse,
-        'MAE': mae,
-        'n_samples': len(df_data)
-    }
-    
+    residuals = y_true_arr - y_pred # Unweighted residuals
+
     # Generate output table
     rows = []
     curr_idx = 0
@@ -2738,6 +2820,15 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     else:
         figures = plot_fitting_results_gui(P_final, components, df_data, y_true_arr, true_values, y_pred=y_pred, residuals=residuals)
     
+    # Run Automated Analysis
+    temp_res = {
+        'success': res.success,
+        'cost': res.cost if hasattr(res, 'cost') else res.fun,
+        'metrics': metrics,
+        'residuals': residuals
+    }
+    analysis_log, suggestions = generate_fit_analysis(temp_res, df_data)
+    
     if progress_callback: progress_callback(1.0, "Done!")
     
     return {
@@ -2745,12 +2836,15 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         'cost': res.cost if hasattr(res, 'cost') else res.fun,
         'time': elapsed,
         'metrics': metrics,
+        'report': report_str,
+        'analysis': analysis_log, 
+        'suggestions': suggestions,
         'fitted_params': df_results,
         'P_final': P_final,
         'figures': figures,
+        'residuals': residuals,
         'data': df_data, # Return data in case we want to reuse it
-        'true_values': true_values,
-        'report': report_str
+        'true_values': true_values
     }
 
 if __name__ == "__main__":
@@ -3374,13 +3468,15 @@ def run_bootstrap(n_boot, df_params, df_data, backend='scipy_ls', method='trf', 
     valid_boots = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = [executor.submit(single_boot, i) for i in range(n_boot)]
+        completed_count = 0
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res is not None:
                 valid_boots.append(res)
             
+            completed_count += 1
             if progress_callback:
-                progress_callback((i + 1) / n_boot, f"Bootstrap Iteration {i + 1}/{n_boot}")
+                progress_callback(completed_count / n_boot, f"Bootstrap Iteration {completed_count}/{n_boot}")
                 
     if not valid_boots:
         print("Bootstrap failed: No valid runs.")
