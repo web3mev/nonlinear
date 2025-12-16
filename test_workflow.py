@@ -21,7 +21,7 @@ class TestDashWorkflow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Create a dummy parameters CSV
-        cls.params_str = """RiskFactor_NM,Calc_Type,Sub_Model,X1_Var,X2_Var,Monotonicity,Example_Value,Fixed,Key,X1_Val,X2_Val,RiskFactor,On_Off
+        cls.params_str = """RiskFactor_NM,Calc_Type,Sub_Model,X1_Var_NM,X2_Var_NM,Monotonicity,Example_Value,Fixed,Key,X1_Var_Val,X2_Var_Val,RiskFactor_VAL,On_Off_Flag
 Intercept,DIM_0,,Intercept,,,1,N,1,,,0.0,Y
 age,DIM_1,,age,,,30,N,2,20,,0.1,Y
 age,DIM_1,,age,,,30,N,2,30,,0.2,Y

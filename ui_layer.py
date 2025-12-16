@@ -11,6 +11,7 @@ import glob
 import time
 import streamlit.components.v1 as components
 import threading
+import stats_helper as sh
 
 def render_documentation(tutorial_path="fitting_methods_tutorial.html", model_path="model_explanation.html"):
     """Renders the documentation HTML files."""
@@ -245,13 +246,23 @@ def render_input_section(param_file):
     if 'params_df' in st.session_state:
         with st.expander("Input Data & Parameters", expanded=True):
             st.markdown("### Parameter")
+            
+            # Ensure Notes is text (handle NaNs from empty CSV col)
+            if 'Notes' in st.session_state.params_df.columns:
+                 st.session_state.params_df['Notes'] = st.session_state.params_df['Notes'].astype(str).replace('nan', '')
+            
             column_config = {
                 "RiskFactor_NM": st.column_config.TextColumn("Risk Factor"),
                 "Sub_Model": st.column_config.TextColumn("Sub Model"),
-                "RiskFactor": st.column_config.NumberColumn("Value", format="%.4f"),
-                "On_Off": st.column_config.TextColumn("On/Off"),
+                "RiskFactor_VAL": st.column_config.NumberColumn("Value", format="%.4f"),
+                "On_Off_Flag": st.column_config.TextColumn("On/Off"),
                 "Fixed": st.column_config.TextColumn("Fixed"),
                 "Monotonicity": st.column_config.TextColumn("Monotonicity"),
+                "X1_Var_NM": st.column_config.TextColumn("X1 Var"),
+                "X1_Var_Val": st.column_config.NumberColumn("X1 Val", format="%.4f"),
+                "X2_Var_NM": st.column_config.TextColumn("X2 Var"),
+                "X2_Var_Val": st.column_config.NumberColumn("X2 Val", format="%.4f"),
+                "Notes": st.column_config.TextColumn("Notes", width="large"),
             }
             edited_df = st.data_editor(
                 st.session_state.params_df,
@@ -371,26 +382,86 @@ def render_fitting_control(config):
     st.markdown("---")
     
     # Init session vars
-    for key in ['is_running', 'fitting_error', 'fitting_success']:
+    for key in ['is_running', 'fitting_error', 'fitting_success', 'pruning_results']:
         if key not in st.session_state:
-            st.session_state[key] = None if 'error' in key else False
+             if key == 'pruning_results' or 'error' in key:
+                 st.session_state[key] = None
+             else:
+                 st.session_state[key] = False
 
-    col1, col2 = st.columns([1, 4])
-    with st.expander("Fitting Control & Progress", expanded=True):
-        with col1:
-            if not st.session_state.is_running:
-                if st.button("Start"):
-                    st.session_state.is_running = True
-                    st.session_state.fitting_error = None
-                    st.session_state.fitting_results = None
-                    st.session_state.fitting_success = False
-                    st.rerun()
-            else:
-                if st.button("Stop"):
-                    st.session_state.is_running = False
-                    if 'stop_event' in st.session_state and st.session_state.stop_event:
-                        st.session_state.stop_event.set()
-                    st.rerun()
+    tabs = st.tabs(["Optimization", "Feature Selection (One-Shot Pruning)"])
+    
+    with tabs[1]:
+        st.markdown("#### One-Shot Pruning")
+        st.markdown("""
+        Runs a quick unconstrained model fit to test the statistical significance of each variable.
+        Disables monotonicity constraints for this step to calculate valid Wald P-values.
+        """)
+        
+        col_p1, col_p2 = st.columns([1, 4])
+        with col_p1:
+            if st.button("Run Pruning Test"):
+                 if 'params_df' in st.session_state and 'fitting_data' in st.session_state:
+                     with st.spinner("Running unconstrained pruning test..."):
+                         try:
+                             # Default p-val threshold 0.05
+                             # Use backend from config or default 'scipy_ls'
+                             backend_prune = config.get('fitting_backend', 'scipy_ls')
+                             # Some backends like 'scipy_min' might be slower or handle unconstrained differently
+                             # Safest is scipy_ls or poisson_lbfgsb
+                             
+                             df_prune = nlf.run_pruning_test(
+                                 st.session_state.params_df, 
+                                 st.session_state.fitting_data, 
+                                 backend=backend_prune,
+                                 p_threshold=0.05
+                             )
+                             st.session_state.pruning_results = df_prune
+                             st.success("Pruning test complete.")
+                         except Exception as e:
+                             st.error(f"Pruning failed: {e}")
+                 else:
+                     st.error("Data or Parameters missing.")
+
+        if st.session_state.pruning_results is not None:
+             st.dataframe(st.session_state.pruning_results, width='stretch')
+             
+             if st.button("Apply Pruning Suggestions"):
+                 to_prune = st.session_state.pruning_results[
+                     st.session_state.pruning_results['Recommendation'] == 'Prune'
+                 ]['RiskFactor_NM'].tolist()
+                 
+                 if to_prune:
+                     df = st.session_state.params_df
+                     # disable
+                     df.loc[df['RiskFactor_NM'].isin(to_prune), 'On_Off_Flag'] = 'N'
+                     st.session_state.params_df = df
+                     st.success(f"Disabled {len(to_prune)} variables: {', '.join(to_prune)}")
+                     st.rerun()
+                 else:
+                     st.info("No variables to prune based on current results.")
+                     
+    with tabs[0]:
+
+
+
+
+        col1, col2 = st.columns([1, 4])
+        with st.expander("Fitting Control & Progress", expanded=True):
+            with col1:
+                if not st.session_state.is_running:
+                    if st.button("Start"):
+                        st.session_state.is_running = True
+                        st.session_state.fitting_error = None
+                        st.session_state.fitting_results = None
+                        st.session_state.fitting_success = False
+                        st.rerun()
+                else:
+                    if st.button("Stop"):
+                        st.session_state.is_running = False
+                        if 'stop_event' in st.session_state and st.session_state.stop_event:
+                            st.session_state.stop_event.set()
+                        st.rerun()
         
         # Cleanup Logic
         if not st.session_state.is_running and 'fitting_thread' in st.session_state and st.session_state.fitting_thread and st.session_state.fitting_thread.is_alive():
@@ -519,7 +590,7 @@ def display_figure(fig):
     else: # Matplotlib
         st.pyplot(fig)
 
-def render_results():
+def render_results(key_prefix=""):
     """Renders the Results section, including Loaded Model."""
     if 'loaded_model' in st.session_state:
         st.markdown("---")
@@ -527,7 +598,7 @@ def render_results():
             model = st.session_state.loaded_model
             st.markdown("### Fit Report (Loaded)")
             st.code(model['report'], language='text')
-            if st.button("Clear Loaded Model"):
+            if st.button("Clear Loaded Model", key=f"{key_prefix}btn_clear_loaded"):
                 del st.session_state.loaded_model
                 st.rerun()
 
@@ -578,16 +649,207 @@ def render_results():
                     display_df['X2_Knot'] = display_df['X2_Knot'].astype(str)
                     st.dataframe(display_df)
             
-            st.subheader("Diagnostic Plots")
-            figures = results['figures']
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: display_figure(figures['Actual vs Predicted'])
-            with c2: display_figure(figures['Residuals vs Predicted'])
-            with c3: display_figure(figures['Histogram of Residuals'])
-            with c4: display_figure(figures['Q-Q Plot'])
+            is_ml = results.get('is_ml_model', False)
+            
+            # --- Diagnostic Plots ---
+            figures = {}
+            if not is_ml:
+                # SPLINE: Use backend plotting logic
+                try:
+                    if 'figures' in results: # Pre-calculated
+                        figures = results['figures']
+                    elif 'P_final' in results: # Re-calculate
+                        figures = nlf.plot_fitting_results_gui(
+                            results['P_final'], 
+                            results['components'], 
+                            results['data']
+                        )
+                except Exception as e:
+                    st.warning(f"Could not generate spline plots: {e}")
+            else:
+                # ML MODEL: Generate Diagnostics on the Fly from Residuals
+                st.info(f"ML Model: {results.get('backend', 'ML').upper()}")
+                if 'features' in results:
+                    st.markdown("**Features Used:** " + ", ".join(results['features']))
+                
+                # Basic diagnostic plots
+                if 'y' in results['data'] and 'y_pred_train' in results:
+                     y = results['data']['y']
+                     pred = results['y_pred_train']
+                     resid = results['residuals']
+                     
+                     # 1. Actual vs Pred
+                     fig1, ax1 = plt.subplots(figsize=(6,4), dpi=100)
+                     ax1.scatter(y, pred, alpha=0.3, s=10)
+                     ax1.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+                     ax1.set_xlabel("Actual")
+                     ax1.set_ylabel("Predicted")
+                     ax1.set_title("Actual vs Predicted")
+                     figures['Actual vs Predicted'] = fig1
+                     plt.close(fig1)
+
+                     # 2. Res vs Pred
+                     fig2, ax2 = plt.subplots(figsize=(6,4), dpi=100)
+                     ax2.scatter(pred, resid, alpha=0.3, s=10)
+                     ax2.axhline(0, color='r', linestyle='--')
+                     ax2.set_xlabel("Predicted")
+                     ax2.set_ylabel("Residuals")
+                     ax2.set_title("Residuals vs Predicted")
+                     figures['Residuals vs Predicted'] = fig2
+                     plt.close(fig2)
+                     
+                     # 3. Hist
+                     fig3, ax3 = plt.subplots(figsize=(6,4), dpi=100)
+                     ax3.hist(resid, bins=30, edgecolor='k', alpha=0.7)
+                     ax3.set_title("Histogram of Residuals")
+                     figures['Histogram of Residuals'] = fig3
+                     plt.close(fig3)
+                     
+                     # 4. QQ
+                     fig4, ax4 = plt.subplots(figsize=(6,4), dpi=100)
+                     import scipy.stats as stats
+                     stats.probplot(resid, dist="norm", plot=ax4)
+                     ax4.set_title("Q-Q Plot")
+                     figures['Q-Q Plot'] = fig4
+                     plt.close(fig4)
+                     
+                     # 5. Advanced ML Plots (Importance, SHAP, PDP)
+                     if 'diagnostics' in results:
+                         diag = results['diagnostics']
+                         
+                         # Feature Importance
+                         if 'importance' in diag:
+                             imp = diag['importance']
+                             feats = imp['feature']
+                             
+                             # Plot Gain
+                             if 'gain' in imp:
+                                 # Sort by gain
+                                 sorted_idx = np.argsort(imp['gain'])
+                                 sorted_feats = [feats[i] for i in sorted_idx]
+                                 sorted_gain = [imp['gain'][i] for i in sorted_idx]
+                                 
+                                 fig_imp, ax_imp = plt.subplots(figsize=(8, len(feats)*0.3 + 2), dpi=100)
+                                 ax_imp.barh(sorted_feats, sorted_gain, color=nlf.COLORS.get('liteblue', 'skyblue'))
+                                 ax_imp.set_title("Feature Importance (Gain)")
+                                 ax_imp.set_xlabel("Gain")
+                                 plt.tight_layout()
+                                 figures['Feature Importance (Gain)'] = fig_imp
+                                 plt.close(fig_imp)
+                        
+                         # SHAP Summary
+                         if 'shap' in diag:
+                             shap_data = diag['shap']
+                             if 'shap_values' in shap_data and 'X_shap' in shap_data:
+                                 try:
+                                     # Need shap installed for summary_plot
+                                     import shap
+                                     fig_shap = plt.figure(figsize=(8, 6), dpi=100)
+                                     shap.summary_plot(shap_data['shap_values'], shap_data['X_shap'], show=False)
+                                     # summary_plot modifies current axis or creates one. 
+                                     # It doesn't return fig. We captured it in fig_shap context usually?
+                                     # Actually shap uses matplotlib.pyplot.gcf() if not provided.
+                                     plt.tight_layout()
+                                     figures['SHAP Summary'] = plt.gcf()
+                                     # Note: plt.close() happens after display or we might lose it if not careful.
+                                 except Exception as e:
+                                     pass
+                        
+                         # PDP (Partial Dependence) -> Add to "Parameter Plots" or separate?
+                         # Let's add them to figures dict prefixed with "PDP: "
+                         if 'pdp' in diag:
+                             for feat, data in diag['pdp'].items():
+                                 fig_pdp, ax_pdp = plt.subplots(figsize=(6,4), dpi=100)
+                                 ax_pdp.plot(data['x'], data['y'], color=nlf.COLORS.get('darkblue', 'blue'), linewidth=2)
+                                 ax_pdp.set_title(f"PDP: {feat}")
+                                 ax_pdp.set_xlabel(feat)
+                                 ax_pdp.set_ylabel("Partial Dependence")
+                                 ax_pdp.grid(True, alpha=0.3)
+                                 figures[f"PDP: {feat}"] = fig_pdp
+                                 plt.close(fig_pdp)
+
+            # Render Diagnostic Grid
+            if figures:
+                st.subheader("Diagnostic Plots")
+                c1, c2, c3, c4 = st.columns(4)
+                if 'Actual vs Predicted' in figures:
+                    with c1: display_figure(figures['Actual vs Predicted'])
+                if 'Residuals vs Predicted' in figures:
+                    with c2: display_figure(figures['Residuals vs Predicted'])
+                if 'Histogram of Residuals' in figures:
+                    with c3: display_figure(figures['Histogram of Residuals'])
+                if 'Q-Q Plot' in figures:
+                    with c4: display_figure(figures['Q-Q Plot'])
+            
+            # --- Model Interpretation (ML) ---
+            if is_ml:
+                st.subheader("Model Interpretation")
+                # Expose Errors
+                if 'diagnostics' in results:
+                    diag = results['diagnostics']
+                    if 'shap_error' in diag: st.warning(f"SHAP Error: {diag['shap_error']}")
+                    if 'pdp_error' in diag: st.warning(f"PDP Error: {diag['pdp_error']}")
+                    
+                c1, c2 = st.columns(2)
+                if 'Feature Importance (Gain)' in figures:
+                    with c1: display_figure(figures['Feature Importance (Gain)'])
+                if 'SHAP Summary' in figures:
+                    with c2: display_figure(figures['SHAP Summary'])
             
             st.subheader("Parameter Plots")
-            comp_figs = {k: v for k, v in figures.items() if k.startswith("Component:")}
+            comp_figs = {} # Initialize default
+            if not is_ml:
+                comp_figs = {k: v for k, v in figures.items() if k.startswith("Component:")}
+            else:
+                # Add PDPs to parameter plots
+                 comp_figs = {k: v for k, v in figures.items() if k.startswith("PDP:")}
+            
+            # --- Special Handling for Grouped DIM_0 (Key-based Bar Charts) ---
+            if 'params_df' in st.session_state:
+                p_df = st.session_state.params_df
+                # Ensure we have necessary columns
+                if {'Key', 'Calc_Type', 'On_Off_Flag', 'RiskFactor_NM'}.issubset(p_df.columns):
+                    # Filter DIM_0 groups
+                    dim0_groups = p_df[p_df['Calc_Type'] == 'DIM_0'].groupby('Key')
+                    
+                    for key, group in dim0_groups:
+                        # Condition: Size > 1 AND Any On
+                        is_active_group = (group['On_Off_Flag'] == 'Y').any()
+                        if len(group) > 1 and is_active_group:
+                            # Prepare data
+                            chart_rows = []
+                            for _, row in group.iterrows():
+                                val = row.get('RiskFactor_VAL', 0.0) # Default/Fixed Value
+                                label = row.get('X1_Var_NM', 'Unknown')
+                                is_fitted = row['On_Off_Flag'] == 'Y'
+                                
+                                if is_fitted and 'fitted_params' in results:
+                                    # Lookup fitted value
+                                    rf_nm = row['RiskFactor_NM']
+                                    f_df = results['fitted_params']
+                                    if 'Parameter' in f_df.columns:
+                                        matched = f_df[f_df['Parameter'] == rf_nm]
+                                        if not matched.empty:
+                                             val = matched.iloc[0]['Fitted_Value']
+                                    
+                                chart_rows.append({'Variable': label, 'Value': val, 'Type': 'Fitted' if is_fitted else 'Fixed'})
+                                
+                            if chart_rows:
+                                c_df = pd.DataFrame(chart_rows)
+                                # Generate Figure matching style
+                                # Colors: 'liteblue' for Fitted, 'grey' for Fixed
+                                colors = [nlf.COLORS.get('liteblue', 'skyblue') if t == 'Fitted' else nlf.COLORS.get('grey', 'lightgrey') for t in c_df['Type']]
+                                
+                                fig_g, ax_g = plt.subplots(figsize=(6, 4))
+                                ax_g.bar(c_df['Variable'], c_df['Value'], color=colors)
+                                ax_g.set_title(key) # Title is Key
+                                ax_g.set_ylabel("Value")
+                                plt.setp(ax_g.get_xticklabels(), rotation=45, ha='right')
+                                plt.tight_layout()
+                                
+                                # Add to display list
+                                comp_figs[f"Group: {key}"] = fig_g
+
             cols = st.columns(4)
             for i, (name, fig) in enumerate(comp_figs.items()):
                 with cols[i % 4]: display_figure(fig)
@@ -622,11 +884,131 @@ def render_results():
                 flush_buffer_1d(buffer_1d)
                 
             st.markdown("---")
-            if st.button("Export Fitted Parameters"):
-                # ... (Export Logic - Simplified for brevity, kept full in implementation if needed) ...
-                # Reusing existing export logic logic
-                pass 
+            
+            # --- Advanced Validation ---
+            st.subheader("Advanced Validation")
+            
+            # Prepare Data for Validation
+            # results['data'] is the dataframe used for fitting
+            # P_final and components needed for scoring code
+            
+            if 'data' in results and 'residuals' in results:
+                raw_data = results['data']
+                if hasattr(raw_data, 'to_pandas'):
+                    val_df = raw_data.to_pandas().copy()
+                else:
+                    val_df = raw_data.copy()
+                
+                # Reconstruct Predictions: y_pred = y_true - residuals (unweighted)
+                # results['residuals'] = y - y_pred
+                if 'y' in val_df.columns:
+                     val_df['pred'] = val_df['y'] - results['residuals']
+                else:
+                     # Fallback if y not in data (unlikely)
+                     st.warning("Cannot reconstruct predictions for validation plots.")
+                     val_df['pred'] = 0
+                
+                # 1. Renaming Columns for Trends
+                rename_map = {}
+                for c in val_df.columns:
+                    lower_c = c.lower()
+                    if lower_c in ['fdate', 'month']: rename_map[c] = 'date'
+                    elif lower_c in ['oyr', 'vintage']: rename_map[c] = 'vintage'
+                    elif lower_c in ['coupon', 'couponrate']: rename_map[c] = 'coupon'
+                val_df.rename(columns=rename_map, inplace=True)
+                
+                # Ensure date is datetime
+                if 'date' in val_df.columns:
+                    val_df['date'] = pd.to_datetime(val_df['date'], errors='coerce')
+                
+                # 2. Decile Lift Chart
+                # 2. Collect Data
+                plots_data = [] # List of tuples: (title, x, y_act, y_pred, volume_x, volume_y, xlabel)
+                
+                # Lift Chart Data
+                if 'w' in val_df.columns:
+                     lift_data = sh.calculate_lift_chart_data(val_df['y'], val_df['pred'], val_df['w'], n_bins=10)
+                     if not lift_data.empty:
+                         plots_data.append({
+                             'title': "Lift Chart",
+                             'x': lift_data['bin'],
+                             'y_act': lift_data['mean_actual'],
+                             'y_pred': lift_data['mean_predicted'],
+                             'vol_x': None, 'vol_y': None,
+                             'xlabel': "Risk Decile"
+                         })
 
+                # Trends Data
+                trend_cols = ['date', 'vintage', 'coupon']
+                valid_trends = [c for c in trend_cols if c in val_df.columns]
+                
+                for col in valid_trends:
+                     agg = sh.calculate_aggregated_metric(val_df, col, 'y', 'pred', 'w')
+                     plots_data.append({
+                         'title': f"Act vs Model by {col.title()}",
+                         'x': agg[col],
+                         'y_act': agg['mean_actual'],
+                         'y_pred': agg['mean_predicted'],
+                         'vol_x': agg[col], 'vol_y': agg['count'],
+                         'xlabel': col.title()
+                     })
+                
+                # Render Single Subplot Figure
+                if plots_data:
+                    n_plots = len(plots_data)
+                    n_cols = 2 if n_plots > 1 else 1 # If only 1, standard size
+                    n_rows = (n_plots + 1) // 2 if n_plots > 1 else 1
+                    
+                    # Reduce Font Size context
+                    with plt.rc_context({'font.size': 8, 'axes.titlesize': 9, 'axes.labelsize': 8}):
+                         fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows), dpi=300)
+                         if n_plots == 1: axes = [axes] # Ensure iterable
+                         else: axes = axes.flatten()
+                         
+                         for i, data in enumerate(plots_data):
+                             ax = axes[i]
+                             # Actual: Dark Blue, Solid, Marker
+                             ax.plot(data['x'], data['y_act'], color=nlf.COLORS['darkblue'], linestyle='-', marker='o', markersize=3, label='Actual', linewidth=1)
+                             # Model: Yellow (Gold), Solid, Marker
+                             ax.plot(data['x'], data['y_pred'], color=nlf.COLORS['yellow'], linestyle='-', marker='s', markersize=3, label='Model', linewidth=1)
+                             
+                             # Volume
+                             if data['vol_x'] is not None:
+                                 ax2 = ax.twinx()
+                                 ax2.bar(data['vol_x'], data['vol_y'], alpha=0.15, color='gray', label='Volume')
+                                 ax2.set_ylabel('Volume', fontsize=7)
+                                 ax2.tick_params(axis='y', labelsize=7)
+                                 ax2.grid(False) # Turn off grid for volume to avoid clutter
+                             
+                             ax.set_title(data['title'])
+                             ax.set_xlabel(data['xlabel'])
+                             ax.set_ylabel("Mean Response")
+                             ax.legend(loc='upper left', fontsize=7)
+                             ax.grid(True, linestyle=':', alpha=0.5)
+                         
+                         # Hide empty subplots
+                         for i in range(n_plots, len(axes)):
+                             axes[i].axis('off')
+                         
+                         plt.tight_layout()
+                         st.pyplot(fig)
+                         plt.close(fig)
+                         
+                else:
+                    st.info("No validation plots available (missing data or columns).")
+
+            st.markdown("---")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                # Original Export Button (if logic exists elsewhere, or placeholder)
+                if st.button("Export Fitted Parameters", key=f"{key_prefix}btn_export_params"):
+                    # Placeholder logic from original file
+                    pass
+            with c2:
+                if 'P_final' in results and 'components' in results:
+                     sql_code = nlf.generate_scoring_code(results['components'], results['P_final'], 'sql')
+                     st.download_button("Download Scoring SQL", sql_code, "scoring_model.sql", "text/plain", key=f"{key_prefix}btn_dl_sql")
 # --- Advanced Features (Bootstrap, CV, MCMC) ---
 import threading
 
@@ -841,3 +1223,116 @@ def render_advanced_features(config):
             fig = corner.corner(mcmc_res[:, :n_plot], labels=[f"p{i}" for i in range(n_plot)])
             st.pyplot(fig)
 
+
+def render_ml_fitting(config):
+    """Renders the Machine Learning Fitting section."""
+    st.header("Machine Learning Fitting")
+    st.markdown("Fit using LightGBM or XGBoost. Good for capturing complex non-linearities without explicit knots.")
+    
+    ml_backend = st.selectbox("ML Backend", ["LightGBM", "XGBoost"], key='ml_backend_sel_main')
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        n_est = st.number_input("Number of Estimators", 10, 5000, 100, step=10, key='ml_nest_main')
+        lr = st.number_input("Learning Rate", 0.001, 1.0, 0.1, step=0.01, format="%.3f", key='ml_lr_main')
+        max_depth = st.number_input("Max Depth", 1, 20, 5, key='ml_depth_main')
+    with c2:
+        subsample = st.slider("Subsample", 0.1, 1.0, 0.8, key='ml_subsample_main')
+        colsample = st.slider("Colsample by Tree", 0.1, 1.0, 0.8, key='ml_colsample_main')
+        enforce_mono = st.checkbox("Enforce Monotonicity", value=True, help="Use constraints from Parameter table (Ascending/Descending).", key='ml_mono_main')
+        
+    if st.button("Fit ML Model", type="primary", key='btn_fit_ml_main'):
+        if st.session_state.get('params_df') is not None and st.session_state.get('fitting_data') is not None:
+            with st.spinner(f"Training {ml_backend}..."):
+                try:
+                    options = {
+                        'n_estimators': n_est,
+                        'learning_rate': lr,
+                        'max_depth': max_depth,
+                        'subsample': subsample,
+                        'colsample_bytree': colsample,
+                        'enforce_constraints': enforce_mono
+                    }
+                    
+                    res = nlf.fit_ml_model(
+                        st.session_state.fitting_data,
+                        nlf.load_model_spec(df=st.session_state.params_df), # Need separate parsing call or pass df? nlf.load_model_spec works.
+                        backend=ml_backend.lower(),
+                        options=options
+                    )
+                    
+                    if res.get('success'):
+                        st.session_state.fitting_results = res
+                        st.session_state.fitting_success = True
+                        st.success(f"{ml_backend} fitting complete. Check 'Results' tab (or below if integrated).")
+                    else:
+                        st.error(f"Fitting failed: {res.get('message')}")
+                        
+                except Exception as e:
+                    st.error(f"ML Fitting Error: {e}")
+        else:
+            st.error("Data or Parameters missing.")
+            
+    # Show results if available
+    if st.session_state.get('fitting_results') and st.session_state.get('fitting_success'):
+        st.markdown("---")
+        render_results(key_prefix="ml_")
+
+def render_nn_fitting(config):
+    """Renders the Neural Network Fitting section."""
+    st.header("Neural Network Fitting")
+    st.markdown("Fit using a Bagged Feedforward Neural Network (PyTorch).")
+    st.markdown("""
+    **Architecture**: 5 Hidden Layers (512→256→128→32→8), ReLU, Batch Norm, Dropout (0.4).
+    **Ensemble**: Bagging (averaging multiple networks) to reduce variance.
+    """)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        n_epochs = st.number_input("Epochs", 10, 1000, 50, step=10, key='nn_epochs')
+        batch_size = st.selectbox("Batch Size", [32, 64, 128, 256, 512, 1024, 2048, 4096], index=6, key='nn_batch')
+        lr = st.number_input("Learning Rate", 0.0001, 0.1, 0.001, format="%.4f", key='nn_lr')
+    
+    with col2:
+        n_bags = st.slider("Number of Bags (Models)", 1, 10, 3, help="Train N models on bootstrapped data and average them.", key='nn_bags')
+        dropout = st.slider("Dropout Rate", 0.0, 0.9, 0.4, step=0.1, key='nn_dropout')
+
+    if st.button("Fit Neural Network", type="primary", key='btn_fit_nn'):
+        if st.session_state.get('params_df') is not None and st.session_state.get('fitting_data') is not None:
+             with st.spinner(f"Training Neural Network ({n_bags} bags x {n_epochs} epochs)..."):
+                 try:
+                     options = {
+                        'epochs': n_epochs,
+                        'batch_size': batch_size,
+                        'learning_rate': lr,
+                        'dropout': dropout,
+                        'n_bags': n_bags
+                     }
+                     
+                     # Assuming fit_neural_network is in nonlinear_fitting_numba
+                     res = nlf.fit_neural_network(
+                        st.session_state.fitting_data,
+                        nlf.load_model_spec(df=st.session_state.params_df),
+                        options=options
+                     )
+                     
+                     if res.get('success'):
+                         st.session_state.fitting_results = res
+                         st.session_state.fitting_success = True
+                         st.success("Neural Network training complete.")
+                     else:
+                         st.error(f"Training failed: {res.get('message')}")
+                         
+                 except Exception as e:
+                     st.error(f"NN Fitting Error: {e}")
+        else:
+             st.error("Data or Parameters missing.")
+
+    # Show results if available (reuse render_results with 'nn_' prefix)
+    # Note: ML Diagnostics (SHAP/Importance) currently only support LightGBM/XGBoost.
+    # NN won't have 'diagnostics' populated unless we implement Permutation Importance later.
+    if st.session_state.get('fitting_results') and st.session_state.get('fitting_success'):
+        # Check if it IS a NN result (msg or backend) to avoid showing stale ML results if fit failed logic leaked (unlikely)
+        if st.session_state.fitting_results.get('backend', '').startswith('PyTorch'):
+             st.markdown("---")
+             render_results(key_prefix="nn_")

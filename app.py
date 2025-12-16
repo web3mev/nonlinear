@@ -57,7 +57,8 @@ if df_loaded is not None:
 
 
 # --- 3. UI Sections (Tabs) ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Data Exploration", "Model Specification", "Model Fitting", "Advanced", "Documentation"])
+# --- 3. UI Sections (Tabs) ---
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Data Exploration", "Model Specification", "Model Fitting", "Advanced", "Machine Learning Fitting", "Neural Network Fitting", "Documentation"])
 
 with tab1:
     ui.render_exploration()
@@ -74,5 +75,11 @@ with tab4:
     ui.render_advanced_features(config)
 
 with tab5:
+    ui.render_ml_fitting(config)
+
+with tab6:
+    ui.render_nn_fitting(config)
+
+with tab7:
     ui.render_documentation()
 

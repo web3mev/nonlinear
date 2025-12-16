@@ -1,4 +1,7 @@
 
+import numpy as np
+import pandas as pd
+
 # --- Helper Functions for Plotting ---
 def get_centered_weighted_stats(x_col, y_col, w_col, knots, data):
     # Ensure knots are sorted and unique
@@ -111,3 +114,99 @@ def get_centered_weighted_stats_2d(x1_col, x2_col, y_col, w_col, knots_x1, knots
         
     grid = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
     return grid
+
+def calculate_lift_chart_data(y_true, y_pred, w, n_bins=10):
+    """
+    Calculates Decile Lift Chart data.
+    Groups by predicted risk deciles.
+    """
+    if len(y_true) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({'y': y_true, 'pred': y_pred, 'w': w})
+    
+    # Sort by Prediction
+    df = df.sort_values('pred')
+    
+    # Cumulative Weight to define bins
+    df['cum_w'] = df['w'].cumsum()
+    total_w = df['w'].sum()
+    
+    # Define bin edges based on total weight
+    bin_edges = np.linspace(0, total_w, n_bins + 1)
+    
+    # Assign bins using searchsorted
+    # bins: 1 to n_bins
+    bins = np.searchsorted(bin_edges, df['cum_w'], side='left')
+    # Clip to ensure valid range (searchsorted might return 0 or n_bins+1 theoretically for floats)
+    bins = np.clip(bins, 1, n_bins)
+    
+    df['bin'] = bins
+    
+    # Aggregate
+    # Weighted Mean Actual and Predicted per bin
+    agg = df.groupby('bin').apply(
+        lambda x: pd.Series({
+            'mean_actual': np.average(x['y'], weights=x['w']),
+            'mean_predicted': np.average(x['pred'], weights=x['w']),
+            'sum_weight': x['w'].sum()
+        })
+    ).reset_index()
+    
+    agg['lift'] = agg['mean_actual'] / df['y'].mean() # Simple Lift Ratio?
+    # Usually Lift is Mean Actual in Bin / Overall Mean Actual
+    # Or Mean Actual / Mean Predicted.
+    # User asked for "Avg Predicted vs Avg Actual".
+    
+    return agg
+
+def calculate_aggregated_metric(df, group_col, y_col, pred_col, w_col):
+    """
+    Calculates weighted mean of actual and predicted by a grouping column.
+    Useful for Actual vs Expected by Time/Vintage.
+    """
+    # Create a working dataframe
+    temp = df[[group_col, y_col, pred_col, w_col]].copy()
+    temp.dropna(subset=[group_col], inplace=True)
+    
+    agg = temp.groupby(group_col).apply(
+        lambda x: pd.Series({
+            'mean_actual': np.average(x[y_col], weights=x[w_col]),
+            'mean_predicted': np.average(x[pred_col], weights=x[w_col]),
+            'count': len(x)
+        })
+    ).reset_index()
+    
+    return agg.sort_values(group_col)
+
+def calculate_gini(y_true, y_pred, w):
+    """
+    Calculates Gini Coefficient.
+    Gini = 2 * AUC - 1
+    """
+    # Sort by predicted risk (descending)
+    inds = np.argsort(y_pred)[::-1]
+    a_s = y_true[inds]
+    w_s = w[inds]
+    
+    cum_w = np.cumsum(w_s)
+    sum_w = cum_w[-1]
+    
+    cum_a = np.cumsum(a_s * w_s)
+    sum_a = cum_a[-1]
+    
+    if sum_w == 0 or sum_a == 0:
+        return 0.0
+    
+    # Lorentz curve coordinates
+    x = cum_w / sum_w
+    y = cum_a / sum_a
+    
+    # Area Under Curve
+    # Insert (0,0) to ensure curve starts at origin
+    x = np.insert(x, 0, 0)
+    y = np.insert(y, 0, 0)
+    
+    auc = np.trapz(y, x)
+    g = 2 * auc - 1
+    return g

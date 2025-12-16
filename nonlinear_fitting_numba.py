@@ -58,6 +58,10 @@ def configure_threading():
 def load_model_spec(csv_path='parameters.csv', df=None):
     if df is None:
         df = pd.read_csv(csv_path)
+    
+    # Ensure Notes column exists
+    if 'Notes' not in df.columns:
+        df['Notes'] = ""
         
     # We only fit parameters that are ON ('Y').
     # However, for plotting, we might want to see bins for knots that are OFF.
@@ -69,7 +73,10 @@ def load_model_spec(csv_path='parameters.csv', df=None):
     # Group by RiskFactor_NM on the full DF to access all knots
     for rf_nm, group_full in df.groupby('RiskFactor_NM', sort=False):
         # Filter for active rows for FITTING structure
-        group = group_full[group_full['On_Off'] == 'Y'].copy()
+        # On_Off_Flag: 'Y' or 'N'
+        # Fallback to old 'On_Off' if new not present for backward compat? 
+        # User said "replace", so we switch strict.
+        group = group_full[group_full['On_Off_Flag'] == 'Y'].copy()
         
         if len(group) == 0:
             continue # Skip factors that are completely OFF
@@ -82,32 +89,32 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             'name': rf_nm,
             'type': calc_type,
             'sub_model': sub_model,
-            'x1_var': first_row['X1_Var'],
-            'x2_var': first_row['X2_Var'] if pd.notna(first_row['X2_Var']) else None,
+            'x1_var': first_row['X1_Var_NM'],
+            'x2_var': first_row['X2_Var_NM'] if pd.notna(first_row['X2_Var_NM']) else None,
             'monotonicity': str(first_row['Monotonicity']) if pd.notna(first_row['Monotonicity']) else None
         }
         
         if calc_type == 'DIM_0':
-            comp['initial_value'] = group['RiskFactor'].iloc[0]
+            comp['initial_value'] = group['RiskFactor_VAL'].iloc[0]
             comp['fixed'] = group['Fixed'].iloc[0] == 'Y'
             comp['key'] = group['Key'].iloc[0]
             comp['n_params'] = 1
             # Plot knots not really applicable for DIM_0 (scalar)
             
         elif calc_type == 'DIM_1':
-            comp['knots'] = group['X1_Val'].values
-            comp['initial_values'] = group['RiskFactor'].values
+            comp['knots'] = group['X1_Var_Val'].values
+            comp['initial_values'] = group['RiskFactor_VAL'].values
             comp['fixed'] = group['Fixed'].values == 'Y'
             comp['keys'] = group['Key'].values
             comp['n_params'] = len(comp['knots'])
             
             # Plotting Knots (All)
-            comp['plot_knots'] = group_full['X1_Val'].values
+            comp['plot_knots'] = group_full['X1_Var_Val'].values
             
         elif calc_type == 'DIM_2':
             # Fitting Knots
-            knots_x1 = sorted(group['X1_Val'].unique())
-            knots_x2 = sorted(group['X2_Val'].unique())
+            knots_x1 = sorted(group['X1_Var_Val'].unique())
+            knots_x2 = sorted(group['X2_Var_Val'].unique())
             comp['knots_x1'] = np.array(knots_x1)
             comp['knots_x2'] = np.array(knots_x2)
             comp['n_rows'] = len(knots_x1)
@@ -115,17 +122,17 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             comp['n_params'] = len(knots_x1) * len(knots_x2)
             
             # Plotting Knots (All)
-            comp['plot_knots_x1'] = np.array(sorted(group_full['X1_Val'].unique()))
-            comp['plot_knots_x2'] = np.array(sorted(group_full['X2_Val'].unique()))
+            comp['plot_knots_x1'] = np.array(sorted(group_full['X1_Var_Val'].unique()))
+            comp['plot_knots_x2'] = np.array(sorted(group_full['X2_Var_Val'].unique()))
             
             grid_values = np.zeros((len(knots_x1), len(knots_x2)))
             grid_fixed = np.zeros((len(knots_x1), len(knots_x2)), dtype=bool)
             
             for _, row in group.iterrows():
                 try:
-                    i = knots_x1.index(row['X1_Val'])
-                    j = knots_x2.index(row['X2_Val'])
-                    grid_values[i, j] = row['RiskFactor']
+                    i = knots_x1.index(row['X1_Var_Val'])
+                    j = knots_x2.index(row['X2_Var_Val'])
+                    grid_values[i, j] = row['RiskFactor_VAL']
                     grid_fixed[i, j] = row['Fixed'] == 'Y'
                 except ValueError:
                     continue
@@ -215,6 +222,33 @@ def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
                         # Let's use Uniform(-2, 2) instead of Normal(0, 1) for broader coverage
                         data[var_name] = rng.uniform(-2, 2, n_samples)
                 generated_vars.add(var_name)
+
+    # --- Add Helper Columns for Trend Validation ---
+    # fdate: 2018-01 to 2025-12 (Monthly)
+    from pandas.tseries.offsets import MonthBegin
+    start_date = pd.Timestamp('2018-01-01')
+    end_date = pd.Timestamp('2025-12-01')
+    date_range = pd.date_range(start_date, end_date, freq='MS')
+    # Use increasing probability for newer dates (Volume growth)
+    p_dates = np.linspace(0.5, 1.5, len(date_range))
+    p_dates /= p_dates.sum()
+    dates_chosen = rng.choice(date_range, size=n_samples, p=p_dates)
+    data['fdate'] = dates_chosen
+
+    # oyr: 2010 to 2025 (Integer Year)
+    oyr_range = np.arange(2010, 2026)
+    # Use 'Normal-ish' around 2020
+    p_oyr = np.exp(-0.5 * ((oyr_range - 2020) / 4)**2)
+    p_oyr /= p_oyr.sum()
+    data['oyr'] = rng.choice(oyr_range, size=n_samples, p=p_oyr)
+
+    # coupon: 1.5 to 7.5, step 0.5
+    coupon_range = np.arange(1.5, 7.55, 0.5)
+    # Use 'Bi-modal' (Low rates / High rates epochs) or simple Bell
+    # Bell centered at 4.0
+    p_c = np.exp(-0.5 * ((coupon_range - 4.0) / 1.0)**2)
+    p_c /= p_c.sum()
+    data['coupon'] = rng.choice(coupon_range, size=n_samples, p=p_c)
 
     # Calculate y_true
     y_log = np.zeros(n_samples)
@@ -2569,6 +2603,157 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     
     return figures
 
+def calculate_vif(A):
+    """
+    Calculates Variance Inflation Factor (VIF) for the design matrix A.
+    """
+    try:
+        n_samples = A.shape[0]
+        # Check density
+        if scipy.sparse.issparse(A):
+            means = np.array(A.mean(axis=0)).flatten()
+            ATA = (A.T @ A).toarray()
+        else:
+            means = np.array(A.mean(axis=0)).flatten()
+            ATA = A.T @ A
+             
+        n = n_samples
+        # Covariance (unscaled)
+        Cov = (ATA - n * np.outer(means, means)) / (n - 1)
+        
+        # Diagonal variances
+        v = np.diag(Cov)
+        
+        valid_idx = v > 1e-12
+        if valid_idx.sum() < 2:
+            return np.zeros(len(v))
+            
+        Cov_sub = Cov[np.ix_(valid_idx, valid_idx)]
+        v_sub = v[valid_idx]
+        std_sub = np.sqrt(v_sub)
+        
+        # Correlation Matrix
+        Corr = Cov_sub / np.outer(std_sub, std_sub)
+        
+        try:
+             InvCorr = np.linalg.inv(Corr)
+             vifs_sub = np.diag(InvCorr)
+        except np.linalg.LinAlgError:
+             vifs_sub = np.full(len(std_sub), np.inf)
+             
+        vifs = np.zeros(len(v))
+        vifs[valid_idx] = vifs_sub
+        return vifs
+        
+    except Exception as e:
+        print(f"VIF Calculation failed: {e}")
+        return None
+
+def generate_scoring_code(components, P, language='sql'):
+    """
+    Generates scoring code (SQL/Python) for the fitted model.
+    """
+    code = []
+    if language == 'sql':
+        code.append("-- SQL Scoring Logic (Predicted Log Odds / Log SMM)")
+        code.append("SELECT")
+        terms = []
+        curr_idx = 0
+        for comp in components:
+            n = comp['n_params']
+            vals = P[curr_idx : curr_idx + n]
+            curr_idx += n
+            name = comp['name']
+            
+            if comp['type'] == 'DIM_0':
+                term = f"{vals[0]:.6f}"
+                terms.append(f"  -- {name}\n  {term}")
+            elif comp['type'] == 'DIM_1':
+                var = comp['x1_var']
+                knots = comp['knots']
+                term_parts = [f"  -- {name} ({var})"]
+                term_parts.append(f"  (CASE")
+                for k in range(len(knots)-1):
+                    k_left = knots[k]; k_right = knots[k+1]
+                    v_left = vals[k]; v_right = vals[k+1]
+                    slope = (v_right - v_left) / (k_right - k_left)
+                    intercept = v_left - slope * k_left
+                    condition = f"WHEN {var} < {k_right:.6f}" if k < len(knots)-2 else "ELSE"
+                    formula = f"{slope:.6f} * {var} + {intercept:.6f}"
+                    term_parts.append(f"    {condition} THEN {formula}")
+                term_parts.append("  END)")
+                terms.append("\n".join(term_parts))
+        code.append(" + \n".join(terms))
+        code.append("AS predicted_value")
+    return "\n".join(code)
+
+def calculate_vif(A):
+    """
+    Calculates Variance Inflation Factor (VIF).
+    """
+    try:
+        n_samples = A.shape[0]
+        if scipy.sparse.issparse(A):
+            means = np.array(A.mean(axis=0)).flatten()
+            ATA = (A.T @ A).toarray()
+        else:
+            means = np.array(A.mean(axis=0)).flatten()
+            ATA = A.T @ A
+             
+        n = n_samples
+        Cov = (ATA - n * np.outer(means, means)) / (n - 1)
+        v = np.diag(Cov)
+        valid_idx = v > 1e-12
+        if valid_idx.sum() < 2: return np.zeros(len(v))
+            
+        Cov_sub = Cov[np.ix_(valid_idx, valid_idx)]
+        std_sub = np.sqrt(v[valid_idx])
+        Corr = Cov_sub / np.outer(std_sub, std_sub)
+        
+        try:
+             vifs_sub = np.diag(np.linalg.inv(Corr))
+        except np.linalg.LinAlgError:
+             vifs_sub = np.full(len(std_sub), np.inf)
+             
+        vifs = np.zeros(len(v))
+        vifs[valid_idx] = vifs_sub
+        return vifs
+    except Exception:
+        return None
+
+def generate_scoring_code(components, P, language='sql'):
+    """
+    Generates scoring code (SQL/Python).
+    """
+    code = []
+    if language == 'sql':
+        code.append("-- SQL Scoring Logic")
+        code.append("SELECT")
+        terms = []
+        curr_idx = 0
+        for comp in components:
+            n = comp['n_params']
+            vals = P[curr_idx : curr_idx + n]
+            curr_idx += n
+            name = comp['name']
+            
+            if comp['type'] == 'DIM_0':
+                terms.append(f"  -- {name}\n  {vals[0]:.6f}")
+            elif comp['type'] == 'DIM_1':
+                var = comp['x1_var']
+                knots = comp['knots']
+                parts = [f"  -- {name} ({var})", "(CASE"]
+                for k in range(len(knots)-1):
+                    slope = (vals[k+1] - vals[k]) / (knots[k+1] - knots[k])
+                    intercept = vals[k] - slope * knots[k]
+                    cond = f"WHEN {var} < {knots[k+1]:.6f}" if k < len(knots)-2 else "ELSE"
+                    parts.append(f"    {cond} THEN {slope:.6f} * {var} + {intercept:.6f}")
+                parts.append("  END)")
+                terms.append("\n".join(parts))
+        code.append(" + \n".join(terms))
+        code.append("AS predicted_value")
+    return "\n".join(code)
+
 def generate_fit_analysis(results, df_data):
     """
     Generates automated analysis and suggestions based on fit results.
@@ -2690,8 +2875,47 @@ def generate_fit_analysis(results, df_data):
                     
             if missing_candidates:
                 formatted = ", ".join(missing_candidates)
-                analysis.append(f"⚠️ **Missing Variables**: High correlation with residuals found for unused variables: {formatted}. Consider adding them.")
-                suggestions.append(f"Consider adding missing variables: {formatted}")
+                analysis.append(f"⚠️ **Missing Variables**: High correlation with residuals found for unused variables: {formatted}.")
+                for cand in missing_candidates:
+                    var_name = cand.split(' ')[0]
+                    suggestions.append(f"Suggestion: Add **{var_name}** as a Linear (DIM_0) or Spline (DIM_1) component.")
+
+        # --- 1.5. Multicollinearity (VIF) ---
+        if df_data is not None:
+             used_vars_list = sorted(list(used_vars))
+             # Filter numeric (Pandas only for now or safe check)
+             numeric_vars = []
+             if isinstance(df_data, pl.DataFrame):
+                  numeric_vars = [v for v in used_vars_list if v in df_data.columns and df_data[v].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
+                  get_col = lambda c: df_data[c].to_numpy()
+             else:
+                  numeric_vars = [v for v in used_vars_list if v in df_data.columns and pd.api.types.is_numeric_dtype(df_data[v])]
+                  get_col = lambda c: df_data[c].values
+             
+             if len(numeric_vars) > 1:
+                  try:
+                      X_list = [get_col(v) for v in numeric_vars]
+                      X_vif = np.column_stack(X_list)
+                      mask = np.isfinite(X_vif).all(axis=1)
+                      if mask.sum() > 10:
+                          X_vif = X_vif[mask]
+                          vifs = calculate_vif(X_vif)
+                          if vifs is not None and len(vifs) == len(numeric_vars):
+                               high_vif = []
+                               max_vif = 0
+                               for i, v in enumerate(vifs):
+                                   if np.isfinite(v):
+                                       max_vif = max(max_vif, v)
+                                       if v > 10:
+                                           high_vif.append(f"{numeric_vars[i]} ({v:.1f})")
+                               
+                               if high_vif:
+                                   analysis.append(f"⚠️ **Multicollinearity**: High VIF (>10) for: {', '.join(high_vif)}.")
+                                   suggestions.append("Check for redundant variables.")
+                               else:
+                                   analysis.append(f"ℹ️ **Multicollinearity**: Max VIF = {max_vif:.2f} (Safe).")
+                  except Exception as e:
+                      print(f"VIF check error: {e}")
 
         # --- 2. Existing Specification Checks ---
         # fitted_params is available for context if needed
@@ -2745,7 +2969,8 @@ def generate_fit_analysis(results, df_data):
                                     # Calc local Error
                                     local_err = np.mean(res_abs[mask])
                                     if local_err > 2.0 * global_rmse and counts[i] > 20:
-                                        suggestions.append(f"💡 Component **{comp['name']}** has high error in interval [{sorted_knots[i]:.2f}, {sorted_knots[i+1]:.2f}] ({local_err:.3f} vs Global {global_rmse:.3f}). Consider adding extensive knots here.")
+                                        midpoint = (sorted_knots[i] + sorted_knots[i+1]) / 2
+                                        suggestions.append(f"💡 Component **{comp['name']}** has high error in interval [{sorted_knots[i]:.2f}, {sorted_knots[i+1]:.2f}]. Suggestion: Insert a new knot near **{midpoint:.2f}**.")
                 
                 # Check 2b: Knot Suggestions for DIM_2 (Marginal)
                 elif comp['type'] == 'DIM_2':
@@ -2770,7 +2995,8 @@ def generate_fit_analysis(results, df_data):
                                          if np.sum(mask) > 20:
                                              local_err = np.mean(res_abs[mask])
                                              if local_err > 1.8 * global_rmse: # slightly looser threshold for marginal
-                                                  suggestions.append(f"💡 Component **{comp['name']}** (Dim {v_name}) has high marginal error in interval [{s_ks[i]:.2f}, {s_ks[i+1]:.2f}]. Consider adding knots/density along this axis.")
+                                                  midpoint = (s_ks[i] + s_ks[i+1]) / 2
+                                                  suggestions.append(f"💡 Component **{comp['name']}** (Dim {v_name}) has high marginal error. Suggestion: Insert a knot near **{midpoint:.2f}** for axis {v_name}.")
 
             if low_impact_vars:
                 formatted_list = ", ".join(low_impact_vars)
@@ -3070,6 +3296,179 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
 if __name__ == "__main__":
     run_fitting()
 
+def run_pruning_test(df_params, df_data, backend='scipy_ls', p_threshold=0.05, progress_callback=None):
+    """
+    Runs a 'One-Shot Pruning' test.
+    1. Fits the model UNCONSTRAINED (ignoring monotonicity) to get valid standard errors.
+    2. Calculates P-values for all parameters.
+    3. Aggregates P-values by Component.
+    4. Suggests pruning if all parameters in a component are insignificant.
+    """
+    if progress_callback: progress_callback(0.1, "Analyzing Model Structure...")
+    
+    # 1. Load Components
+    components = load_model_spec(df=df_params)
+    y_true = df_data['y'].to_numpy()
+    w = df_data['w'].to_numpy()
+    
+    # 2. Fit Unconstrained (mode='direct')
+    if progress_callback: progress_callback(0.3, "Fitting Unconstrained Model...")
+    
+    # Force pack_parameters to 'direct' to ignore monotonicity
+    # And we won't pass bounds to the optimizer (or pass -inf, inf)
+    pack_mode = 'direct'
+    
+    # Prepare Fitting
+    A = precompute_basis(components, df_data)
+    x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
+    
+    # Clear bounds for unconstrained fit
+    # bounds is tuple ([lowers], [uppers])
+    inf_bounds = ([-np.inf]*len(x0), [np.inf]*len(x0))
+    
+    # Fit
+    start_time = time.time()
+    res = None
+    
+    # Use essentially the same backend logic but with new bounds/mode
+    # Note: 'run_fitting_api' logic is too heavy. We call specific fitters directly.
+    # We rely on 'backend' argument.
+    
+    try:
+        if backend == 'scipy_ls':
+            # Least Squares
+            res = scipy.optimize.least_squares(
+                residual_func_fast, x0, jac=jacobian_func_fast, 
+                bounds=inf_bounds, # Unconstrained
+                args=(A, param_mapping, base_P, y_true, w, 0.0, 0.0), # No Reg
+                method='trf', x_scale='jac'
+            )
+        elif backend == 'poisson_lbfgsb':
+            res = fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, inf_bounds, param_mapping_numba, options={})
+        else:
+            # Fallback to scipy_ls for speed/robustness if others are complex
+            res = scipy.optimize.least_squares(
+                residual_func_fast, x0, jac=jacobian_func_fast, 
+                bounds=inf_bounds,
+                args=(A, param_mapping, base_P, y_true, w, 0.0, 0.0),
+                method='trf', x_scale='jac'
+            )
+            
+    except Exception as e:
+        print(f"Pruning fit failed: {e}")
+        return None
+
+    if not res or not res.success:
+        print("Pruning fit did not converge.")
+        # Proceed anyway if we have a result? No, SEs might be garbage.
+        # But usually we return what we have.
+    
+    # 3. Calculate Stats (P-values)
+    if progress_callback: progress_callback(0.8, "Calculating Statistics...")
+    
+    # Helper to calculate Covariance (Reuse logic from fit_report roughly)
+    # Reconstruct P is needed for Weighted Hessian approximation
+    # But here 'x' maps directly to P for the active params? 
+    # Yes, mode='direct' means P = x roughly (modulo fixed ones).
+    
+    # We need to call generate_fit_report or custom logic.
+    # Let's clean up reuse by extracting covariance logic? 
+    # For now, duplicate standard error logic briefly for robustness.
+    
+    x_final = res.x
+    n_params = len(x_final)
+    n_samples = len(y_true)
+    
+    # Reconstruct P
+    # Warning: param_mapping here is the 'direct' one from pack_parameters above
+    P_final = reconstruct_P(x_final, param_mapping, base_P)
+    
+    y_log = A @ P_final
+    y_pred = np.exp(y_log)
+    
+    # Hessian Approx
+    D = (y_pred / w)**2
+    D_mat = scipy.sparse.diags(D)
+    
+    # We need M? 
+    # with mode='direct', M is mostly Identity for active params. 
+    # compute M properly
+    M = get_parameter_jacobian_matrix(x_final, components, param_mapping, base_P)
+    
+    A_T_D_A = A.T @ D_mat @ A
+    H = M.T @ (A_T_D_A @ M)
+    
+    # RSS / Chi2
+    residuals = (y_true - y_pred) / w
+    chisqr = np.sum(residuals**2)
+    dof = n_samples - n_params
+    red_chisqr = chisqr / dof
+    
+    try:
+        cov_x = np.linalg.inv(H) * red_chisqr
+        stderr_x = np.sqrt(np.diag(cov_x))
+    except:
+        stderr_x = np.full(n_params, np.inf)
+        
+    # Calculate P-values (Wald)
+    # Z = x / stderr
+    t_stats = x_final / (stderr_x + 1e-10)
+    p_values = 2 * (1 - scipy.stats.t.cdf(np.abs(t_stats),df=dof)) # Two-tailed
+    
+    # 4. Aggregate by Component
+    results = []
+    
+    # Map params back to components
+    # We iterate similiar to print_fitting_params
+    curr_idx = 0
+    for comp in components:
+        # We only care about active parameters (in x)
+        # But 'components' list includes fixed ones? 
+        # pack_parameters 'direct' mode adds to x0 ONLY if not fixed.
+        
+        # We need to know which indices in x belong to this component.
+        # Construct this from checking which params are not fixed.
+        
+        n_comp_total = comp['n_params']
+        # How many are active?
+        if comp['type'] == 'DIM_1':
+             n_active = np.sum(~comp['fixed'])
+        elif comp['type'] == 'DIM_2':
+             n_active = np.sum(~comp['fixed']) # fixed is 2d array
+        else: # DIM_0
+             n_active = 0 if comp['fixed'] else 1
+             
+        if n_active > 0:
+            # Extract p-values for this component
+            comp_p_vals = p_values[curr_idx : curr_idx + n_active]
+            curr_idx += n_active
+            
+            # Metric: Min P-value (is ANY part significant?)
+            min_p = np.min(comp_p_vals)
+            max_p = np.max(comp_p_vals)
+            
+            decision = "Keep" if min_p < p_threshold else "Prune"
+            
+            results.append({
+                "RiskFactor_NM": comp['name'],
+                "Key": comp.get('key', ''), # DIM_0 has key
+                "Min_P_Value": min_p,
+                "Max_P_Value": max_p,
+                "Recommendation": decision
+            })
+        else:
+            # Fixed component, ignore or mark as Fixed
+            # results.append({"RiskFactor_NM": comp['name'], "Recommendation": "Fixed"})
+            pass
+            
+    df_res = pd.DataFrame(results)
+    if not df_res.empty:
+        df_res = df_res.sort_values('Min_P_Value', ascending=False)
+        
+    if progress_callback: progress_callback(1.0, "Pruning Analysis Complete.")
+    
+    return df_res
+
 def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param_mapping_numba, elapsed_time=None, backend=None, method=None, options=None):
     """
     Generates a fit report similar to lmfit.fit_report().
@@ -3287,7 +3686,10 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
         'r2': r_squared,
         'rmse': rmse,
         'mae': mae,
-        'stderr': stderr_x
+        'stderr': stderr_x,
+        'gini': gini_val,
+        'pseudo_r2': pseudo_r2,
+        'deviance': poisson_deviance
     }
     
     return report_str, metrics
@@ -4053,3 +4455,488 @@ def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method=
     flat_samples = sampler.get_chain(discard=discard, flat=True)
     
     return flat_samples
+
+def calculate_ml_diagnostics(model, X, features, backend):
+    """
+    Calculates Feature Importance, SHAP values, and Partial Dependence.
+    Args:
+        model: Trained learner.
+        X: Feature DataFrame.
+        features: List of feature names.
+        backend: 'lightgbm' or 'xgboost'
+    """
+    diagnostics = {}
+    
+    # 1. Feature Importance
+    # Normalized importance (gain/split) handled by rendering, we just extract raw if possible
+    try:
+        if backend == 'lightgbm':
+            # split and gain
+            imp_split = model.booster_.feature_importance(importance_type='split')
+            imp_gain = model.booster_.feature_importance(importance_type='gain')
+            diagnostics['importance'] = {
+                'feature': features,
+                'split': imp_split,
+                'gain': imp_gain
+            }
+        elif backend == 'xgboost':
+            # XGBoost sklearn API: access feature_importances_ (gain usually)
+            # Or use get_booster().get_score()
+            booster = model.get_booster()
+            gain_score = booster.get_score(importance_type='gain')
+            weight_score = booster.get_score(importance_type='weight') # split
+            
+            # Map back to feature list order
+            diagnostics['importance'] = {
+                'feature': features,
+                'gain': [gain_score.get(f, 0) for f in features],
+                'split': [weight_score.get(f, 0) for f in features]
+            }
+    except Exception as e:
+        print(f"Importance calc failed: {e}")
+        
+    # 2. SHAP Values
+    # Use TreeExplainer. Computationally heavy? Limit sample size.
+    try:
+        import shap
+        # Limit to N samples for speed
+        N_SHAP = 2000
+        if len(X) > N_SHAP:
+            X_shap = X.sample(N_SHAP, random_state=42)
+        else:
+            X_shap = X
+            
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_shap)
+        
+        # Handle multi-class or list outputs (e.g. LightGBM sometimes returns list)
+        if isinstance(shap_values, list):
+             shap_values = shap_values[1] # binary? regression usually array.
+             
+        diagnostics['shap'] = {
+            'shap_values': shap_values, # Array
+            'X_shap': X_shap # DF
+        }
+    except ImportError:
+        diagnostics['shap_error'] = "SHAP library not installed. Run `pip install shap`."
+    except Exception as e:
+        diagnostics['shap_error'] = f"SHAP calculation failed: {str(e)}"
+
+    # 3. Partial Dependence (1D)
+    # Calculate univariable PDP for each feature
+    pdp_results = {}
+    try:
+        # Simple implementation: vary X_j over grid, keep others fixed (average method)
+        # Using sklearn if available is safer/standard
+        from sklearn.inspection import partial_dependence
+        
+        for feat in features:
+            try:
+                # Fast PDP (grid res 50)
+                pd_res = partial_dependence(
+                    model, X, [feat], kind='average', grid_resolution=50,
+                    percentiles=(0.01, 0.99)
+                )
+                
+                pdp_results[feat] = {
+                    'x': pd_res['values'][0],
+                    'y': pd_res['average'][0]
+                }
+            except Exception as ex:
+                pdp_results[feat] = {'error': str(ex)}
+                
+        diagnostics['pdp'] = pdp_results
+        
+    except ImportError:
+         diagnostics['pdp_error'] = "scikit-learn not installed (required for PDP)."
+    except Exception as e:
+         diagnostics['pdp_error'] = f"PDP calculation failed: {str(e)}"
+        
+    return diagnostics
+
+
+def fit_ml_model(df_data, components, backend='lightgbm', options=None):
+    """
+    Fits a Gradient Boosting model (LightGBM or XGBoost).
+    
+    Args:
+        df_data: Polars or Pandas DataFrame containing 'y', 'w', and features.
+        components: List of model components (to define features and monotonicity).
+        backend: 'lightgbm' or 'xgboost'.
+        options: Dict of hyperparameters (n_estimators, learning_rate, max_depth, etc).
+        
+    Returns:
+        dict: A results dictionary mimicking the optimization output (success, metrics, model).
+    """
+    if options is None: options = {}
+    
+    # 1. Imports
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        lgb = None
+        
+    try:
+        import xgboost as xgb
+    except ImportError:
+        xgb = None
+        
+    if backend == 'lightgbm' and lgb is None:
+        return {'success': False, 'message': "LightGBM not installed. Run `pip install lightgbm`."}
+    if backend == 'xgboost' and xgb is None:
+        return {'success': False, 'message': "XGBoost not installed. Run `pip install xgboost`."}
+    
+    if df_data is None:
+        return {'success': False, 'message': "No data provided (df_data is None)."}
+        
+    # 2. Prepare Data
+    # Convert Polars to Pandas for ML libraries (they handle Pandas well)
+    if hasattr(df_data, 'to_pandas'):
+        df = df_data.to_pandas()
+    else:
+        df = df_data.copy()
+        
+    y = df['y']
+    w = df['w']
+    
+    # Extract Features
+    # components define what is "used".
+    # Iterate components to find X vars.
+    features = []
+    # Constraints map: {feature_name: direction} (1, 0, -1)
+    constraints = {}
+    
+    for comp in components:
+        # Ignore DIM_0 (Intercept) for ML - tree handles bias likely, or we can add constant feature?
+        # Usually trees don't need explicit intercept column if they have leaves.
+        
+        # DIM_1
+        if comp['type'] == 'DIM_1':
+            feat = comp['x1_var']
+            if feat not in features:
+                features.append(feat)
+                
+            # Monotonicity
+            # 1 (Inc), -1 (Dec), 0 (None)
+            # implementation_plan said we define it here.
+            try:
+                mono = int(float(comp['monotonicity'])) if comp['monotonicity'] else 0
+            except:
+                mono = 0
+            
+            # If variable already seen, conflict? 
+            # We assume one component per variable for simple cases. 
+            # If multiple components use same var, we take the first non-zero constraint?
+            if feat not in constraints or constraints[feat] == 0:
+                constraints[feat] = mono
+                
+        # DIM_2
+        elif comp['type'] == 'DIM_2':
+             feat1 = comp['x1_var']
+             feat2 = comp['x2_var']
+             if feat1 not in features: features.append(feat1)
+             if feat2 not in features: features.append(feat2)
+             # Monotonicity for interaction is complex ('1/-1'). 
+             # We might skip interaction constraints for now or parse simple ones.
+             # LightGBM supports simple constraints per feature.
+             constraints[feat1] = 0 # partial check?
+             constraints[feat2] = 0 
+             
+    # Prepare X
+    X = df[features]
+    
+    # Prepare Constraints
+    # LightGBM: monotone_constraints="1,-1,0" etc corresponding to columns
+    # XGBoost: monotone_constraints="(1,-1,0)"
+    
+    constraints_list = [] 
+    if backend == 'lightgbm':
+         # LightGBM expects list of ints
+         constraints_list = [constraints.get(f, 0) for f in features]
+    elif backend == 'xgboost':
+         # XGBoost expects tuple of ints
+         constraints_list = tuple([constraints.get(f, 0) for f in features])
+    
+    
+    start_time = time.time()
+    model = None
+    
+    # Hyperparams
+    n_estimators = options.get('n_estimators', 100)
+    learning_rate = options.get('learning_rate', 0.1)
+    max_depth = options.get('max_depth', 5)
+    subsample = options.get('subsample', 0.8)
+    colsample_bytree = options.get('colsample_bytree', 0.8)
+    use_constraints = options.get('enforce_constraints', False)
+    
+    if backend == 'lightgbm':
+        params = {
+            'n_estimators': n_estimators,
+            'learning_rate': learning_rate,
+            'max_depth': max_depth,
+            'subsample': subsample,
+            'colsample_bytree': colsample_bytree,
+            'objective': 'regression', # or 'poisson'
+            'verbosity': -1,
+            'n_jobs': -1
+        }
+        if use_constraints:
+            params['monotone_constraints'] = constraints_list
+            
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X, y, sample_weight=w)
+        
+    elif backend == 'xgboost':
+        params = {
+            'n_estimators': n_estimators,
+            'learning_rate': learning_rate,
+            'max_depth': max_depth,
+            'subsample': subsample,
+            'colsample_bytree': colsample_bytree,
+            'objective': 'reg:squarederror', # or 'count:poisson'
+            'n_jobs': -1
+        }
+        if use_constraints:
+            params['monotone_constraints'] = constraints_list
+            
+        model = xgb.XGBRegressor(**params)
+        model.fit(X, y, sample_weight=w)
+    
+    elapsed = time.time() - start_time
+    
+    # 4. Generate Predictions & Metrics
+    y_pred = model.predict(X)
+    
+    # Metrics
+    # RSS
+    residuals = y - y_pred
+    rss = np.sum(w * residuals**2) # Weighted RSS
+    tss = np.sum(w * (y - np.average(y, weights=w))**2)
+    r_squared = 1 - (rss / tss)
+    rmse = np.sqrt(np.average((y - y_pred)**2, weights=w))
+    mae = np.average(np.abs(y - y_pred), weights=w)
+    
+    metrics = {
+        'r2': r_squared,
+        'rmse': rmse,
+        'mae': mae
+    }
+    
+    # 5. Advanced Diagnostics (Importance, SHAP, PDP)
+    # This might take some time, better to do post-fit or async?
+    # Quick enough for <100k rows. 
+    diagnostics = calculate_ml_diagnostics(model, X, features, backend)
+    
+    # Return structure
+    return {
+        'success': True,
+        'model': model,
+        'is_ml_model': True,
+        'backend': backend,
+        'features': features,
+        'metrics': metrics,
+        'time': elapsed,
+        'data': df, # Pandas DF
+        'residuals': residuals,
+        'y_pred_train': y_pred,
+        'diagnostics': diagnostics
+    }
+
+def fit_neural_network(df_data, components, options=None):
+    """
+    Fits a Bagged Feedforward Neural Network using PyTorch.
+    Architecture: 5 hidden layers (512->256->128->32->8), ReLU, BN, Dropout.
+    """
+    if options is None: options = {}
+    
+    # 1. Check Imports
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        from torch.utils.data import DataLoader, TensorDataset
+    except ImportError:
+        return {'success': False, 'message': "PyTorch not installed. Run `pip install torch`."}
+
+    if df_data is None:
+        return {'success': False, 'message': "No data provided."}
+
+    # 2. Prepare Data
+    if hasattr(df_data, 'to_pandas'):
+        df = df_data.to_pandas()
+    else:
+        df = df_data.copy()
+        
+    y_raw = df['y'].values.astype(np.float32)
+    w_raw = df['w'].values.astype(np.float32)
+    
+    # Extract Features
+    features = []
+    for comp in components:
+        if comp['type'] == 'DIM_1':
+            features.append(comp['x1_var'])
+        elif comp['type'] == 'DIM_2':
+            if comp['x1_var'] not in features: features.append(comp['x1_var'])
+            if comp['x2_var'] not in features: features.append(comp['x2_var'])
+    features = list(dict.fromkeys(features)) # Dedupe
+    
+    X_raw = df[features].values.astype(np.float32)
+    
+    # Check for NaN/Inf
+    if np.isnan(X_raw).any() or np.isinf(X_raw).any():
+        return {'success': False, 'message': "Input data contains NaNs or Infs."}
+    
+    # Preprocessing (Standard Scaling) - Crucial for NN
+    # We should return scaler to apply on new data, but for now just fit context
+    X_mean = np.mean(X_raw, axis=0)
+    X_std = np.std(X_raw, axis=0)
+    X_std[X_std == 0] = 1.0 # Prevent div by zero
+    X_scaled = (X_raw - X_mean) / X_std
+    
+    # Convert to Tensors
+    X_tensor = torch.tensor(X_scaled)
+    y_tensor = torch.tensor(y_raw).view(-1, 1)
+    w_tensor = torch.tensor(w_raw).view(-1, 1) # Weights
+    
+    # 3. Define Model structure
+    class PrepaymentNN(nn.Module):
+        def __init__(self, input_dim, dropout_rate=0.4):
+            super(PrepaymentNN, self).__init__()
+            # 512 -> 256 -> 128 -> 32 -> 8 -> 1
+            self.model = nn.Sequential(
+                nn.Linear(input_dim, 512),
+                nn.BatchNorm1d(512),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                
+                nn.Linear(512, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                
+                nn.Linear(128, 32),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                
+                nn.Linear(32, 8),
+                nn.BatchNorm1d(8),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                
+                nn.Linear(8, 1)
+            )
+            
+        def forward(self, x):
+            return self.model(x)
+
+    def max_norm_constraint(model, max_val=3):
+        for name, param in model.named_parameters():
+             if 'weight' in name and param.dim() > 1:
+                 # Calculate norm of each row (neuron)
+                 # Linear weights are (out_features, in_features)
+                 with torch.no_grad():
+                     norm = param.norm(2, dim=1, keepdim=True).clamp(min=1e-12)
+                     desired = torch.clamp(norm, max=max_val)
+                     param.mul_(desired / norm)
+
+    # 4. Bagging Loop
+    n_bags = options.get('n_bags', 3)
+    epochs = options.get('epochs', 50)
+    batch_size = options.get('batch_size', 64)
+    lr = options.get('learning_rate', 0.001)
+    dropout = options.get('dropout', 0.4)
+    
+    models = []
+    
+    start_time = time.time()
+    
+    dataset = TensorDataset(X_tensor, y_tensor, w_tensor)
+    
+    for bag in range(n_bags):
+         # Bootstrap Sample? Or just random init on full data?
+         # "Bagging" implies bootstrapping data.
+         # Let's resample indices with replacement.
+         # For simplicity/speed in this initial implementation, we might just train on full data 
+         # with different random seeds if n_bags > 1, but true bagging needs resampling.
+         
+         indices = np.random.choice(len(df), size=len(df), replace=True)
+         # Convert to tensor subsets
+         X_bag = X_tensor[indices]
+         y_bag = y_tensor[indices]
+         w_bag = w_tensor[indices]
+         
+         bag_loader = DataLoader(TensorDataset(X_bag, y_bag, w_bag), batch_size=batch_size, shuffle=True)
+         
+         model = PrepaymentNN(X_scaled.shape[1], dropout)
+         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5) # L2 reg
+         criterion = nn.MSELoss(reduction='none') # Handle weights manually
+         
+         model.train()
+         for epoch in range(epochs):
+             ep_loss = 0
+             for bx, by, bw in bag_loader:
+                 optimizer.zero_grad()
+                 outputs = model(bx)
+                 loss_unweighted = criterion(outputs, by)
+                 loss = (loss_unweighted * bw).mean() # Weighted MSE
+                 loss.backward()
+                 optimizer.step()
+                 
+                 # Apply Max-Norm
+                 max_norm_constraint(model)
+                 ep_loss += loss.item()
+         
+         model.eval()
+         models.append(model)
+         
+    elapsed = time.time() - start_time
+    
+    # 5. Prediction (Average)
+    # Ensemble average
+    final_preds = np.zeros(len(df))
+    
+    with torch.no_grad():
+        for m in models:
+            m.eval()
+            p = m(X_tensor).numpy().flatten()
+            final_preds += p
+    
+    final_preds /= n_bags
+    
+    # Calculate Metrics
+    residuals = y_raw - final_preds
+    rss = np.sum(w_raw * residuals**2)
+    tss = np.sum(w_raw * (y_raw - np.average(y_raw, weights=w_raw))**2)
+    r2 = 1 - (rss / tss)
+    rmse = np.sqrt(np.average(residuals**2, weights=w_raw))
+    mae = np.average(np.abs(residuals), weights=w_raw)
+    
+    metrics = {
+        'r2': r2,
+        'rmse': rmse,
+        'mae': mae
+    }
+    
+    # Return structure compatible with render_results
+    # Note: NN is "black box", no easy "fitted_params" table.
+    # We can try to calculate permutation importance for "diagnostics".
+    
+    return {
+        'success': True,
+        'backend': 'PyTorch NN (Bagged)',
+        'is_ml_model': True, # Re-use ML logic for diagnostics
+        'metrics': metrics,
+        'time': elapsed,
+        'data': df,
+        'residuals': residuals,
+        'y_pred_train': final_preds,
+        'features': features,
+        'options': options,
+        'diagnostics': {} # Todo: calculate importance
+    }
