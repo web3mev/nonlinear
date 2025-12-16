@@ -2310,10 +2310,25 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax_m1.plot(stats_act_m1['x'], stats_act_m1['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9)
             ax_m1.plot(stats_mod_m1['x'], stats_mod_m1['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9)
             
+            # Secondary Axis (Balance) for M1
+            ax_m1_2 = ax_m1.twinx()
+            if 'balance' in data.columns:
+                df_temp = data.select([comp['x1_var'], 'balance']).to_pandas()
+                ks = plot_knots_x1
+                if len(ks) > 1:
+                     idx = np.abs(df_temp[comp['x1_var']].values[:, None] - ks[None, :]).argmin(axis=1)
+                     bal_sums = np.zeros(len(ks))
+                     np.add.at(bal_sums, idx, df_temp['balance'].values)
+                     ax_m1_2.plot(ks, bal_sums, color=COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
+            
             ax_m1.set_title(f"Marginal Performance: {comp['name']} (By {comp['x1_var']})")
             ax_m1.set_xlabel(comp['x1_var'])
             ax_m1.set_ylabel('Response')
-            ax_m1.legend()
+            
+            lines, labels = ax_m1.get_legend_handles_labels()
+            lines2, labels2 = ax_m1_2.get_legend_handles_labels()
+            ax_m1_2.legend(lines + lines2, labels + labels2, loc='best')
+            
             ax_m1.grid(True, alpha=0.3)
             figures[f"Performance: {comp['name']} (Marginal {comp['x1_var']})"] = fig_m1
             
@@ -2327,10 +2342,25 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax_m2.plot(stats_act_m2['x'], stats_act_m2['y_mean'], color=COLORS['darkblue'], linestyle='-', marker='o', label='Actual', alpha=0.9)
             ax_m2.plot(stats_mod_m2['x'], stats_mod_m2['y_mean'], color=COLORS['yellow'], linestyle='-', marker='x', label='Model', alpha=0.9)
             
+            # Secondary Axis (Balance) for M2
+            ax_m2_2 = ax_m2.twinx()
+            if 'balance' in data.columns:
+                df_temp = data.select([comp['x2_var'], 'balance']).to_pandas()
+                ks = plot_knots_x2
+                if len(ks) > 1:
+                     idx = np.abs(df_temp[comp['x2_var']].values[:, None] - ks[None, :]).argmin(axis=1)
+                     bal_sums = np.zeros(len(ks))
+                     np.add.at(bal_sums, idx, df_temp['balance'].values)
+                     ax_m2_2.plot(ks, bal_sums, color=COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
+            
             ax_m2.set_title(f"Marginal Performance: {comp['name']} (By {comp['x2_var']})")
             ax_m2.set_xlabel(comp['x2_var'])
             ax_m2.set_ylabel('Response')
-            ax_m2.legend()
+            
+            lines, labels = ax_m2.get_legend_handles_labels()
+            lines2, labels2 = ax_m2_2.get_legend_handles_labels()
+            ax_m2_2.legend(lines + lines2, labels + labels2, loc='best')
+
             ax_m2.grid(True, alpha=0.3)
             figures[f"Performance: {comp['name']} (Marginal {comp['x2_var']})"] = fig_m2
             
@@ -2567,12 +2597,20 @@ def generate_fit_analysis(results, df_data):
     if 'residuals' in results:
         res = results['residuals']
         
+        # Get weights
+        if 'balance' in df_data.columns:
+            weights = df_data['balance'].to_numpy()
+        else:
+            weights = np.ones(len(res))
+
         # Bias
         mean_res = np.mean(res)
+        weighted_mean_res = np.average(res, weights=weights)
         std_res = np.std(res)
-        analysis.append(f"ℹ️ **Bias**: Mean residual is {mean_res:.4g} (Std Dev: {std_res:.4g}).")
         
-        if abs(mean_res) > 0.1 * std_res:
+        analysis.append(f"ℹ️ **Bias**: Mean residual: {mean_res:.4g}, Weighted Mean: {weighted_mean_res:.4g} (Std Dev: {std_res:.4g}).")
+        
+        if abs(mean_res) > 0.1 * std_res or abs(weighted_mean_res) > 0.1 * std_res:
             analysis.append(f"⚠️ **Bias Warning**: Significant bias detected.")
             suggestions.append("The model might be systematically under/over-estimating. Check for missing covariates or incorrect link function.")
             
@@ -2590,6 +2628,165 @@ def generate_fit_analysis(results, df_data):
     # 4. Cost
     if 'cost' in results:
         analysis.append(f"ℹ️ **Final Cost**: {results['cost']:.4g}")
+
+    # 5. Model Specification Analysis
+    if 'components' in results and 'fitted_params' in results:
+        analysis.append("---")
+        analysis.append("**Model Specification**")
+        
+        start_len = len(analysis)
+        comps = results['components']
+        
+        # --- 1. Missing Variables Detection ---
+        if df_data is not None and 'residuals' in results:
+            res = results['residuals']
+            
+            # Identify used variables
+            used_vars = set()
+            for c in comps:
+                if 'x1_var' in c: used_vars.add(c['x1_var'])
+                if 'x2_var' in c and c['x2_var']: used_vars.add(c['x2_var'])
+            
+            # Get numeric columns from df_data
+            # Handle Polars vs Pandas
+            all_numerics = []
+            if isinstance(df_data, pl.DataFrame):
+                # Polars: Select numeric
+                all_numerics = [c for c, t in zip(df_data.columns, df_data.dtypes) if t in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
+                # Helper to get column data
+                get_col = lambda c: df_data[c].to_numpy()
+            else:
+                # Pandas
+                all_numerics = df_data.select_dtypes(include=[np.number]).columns.tolist()
+                get_col = lambda c: df_data[c].values
+                
+            unused_vars = [v for v in all_numerics if v not in used_vars and v not in ['y', 'w', 'balance', 'offset', 'weight']]
+            
+            missing_candidates = []
+            for v in unused_vars:
+                try:
+                    vals = get_col(v)
+                    # Check length match (if df_data was full and res is full, should match)
+                    if len(vals) == len(res):
+                        # Calculate correlation (handle nans)
+                        valid_mask = np.isfinite(vals) & np.isfinite(res)
+                        if np.sum(valid_mask) > 10:
+                            corr, _ = scipy.stats.pearsonr(vals[valid_mask], res[valid_mask])
+                            if abs(corr) > 0.15: # Threshold
+                                missing_candidates.append(f"{v} (corr={corr:.2f})")
+                except:
+                    continue
+                    
+            if missing_candidates:
+                formatted = ", ".join(missing_candidates)
+                analysis.append(f"⚠️ **Missing Variables**: High correlation with residuals found for unused variables: {formatted}. Consider adding them.")
+                suggestions.append(f"Consider adding missing variables: {formatted}")
+
+        # --- 2. Existing Specification Checks ---
+        # fitted_params is available for context if needed
+        
+        P_final = results.get('P_final')
+        
+        if P_final is not None:
+            curr_idx = 0
+            low_impact_vars = []
+            
+            for comp in comps:
+                n = comp['n_params']
+                vals = P_final[curr_idx : curr_idx + n]
+                curr_idx += n
+                
+                # Check 1: Low Impact
+                comp_range = np.ptp(vals)
+                if comp_range < 1e-6:
+                    low_impact_vars.append(f"{comp['name']} (Flat)")
+                
+                # Check 2: Knot Density & New Knot Suggestions (DIM_1 only)
+                if comp['type'] == 'DIM_1':
+                    knots = comp.get('plot_knots', comp['knots'])
+                    sorted_knots = np.sort(knots)
+                    
+                    if len(sorted_knots) > 1 and df_data is not None and comp['x1_var'] in df_data.columns:
+                        x_vals = df_data[comp['x1_var']].to_numpy() if isinstance(df_data, pl.DataFrame) else df_data[comp['x1_var']].values
+                        
+                        # Histogram data
+                        counts, bin_edges = np.histogram(x_vals, bins=sorted_knots)
+                        
+                        # Identify intervals with high error
+                        # Global RMSE reference
+                        global_rmse = metrics.get('rmse', 1.0)
+                        
+                        # Per-interval error
+                        # Needs valid residuals matching df_data
+                        if 'residuals' in results:
+                            res_abs = np.abs(results['residuals'])
+                            # Bin the residuals
+                            indices = np.searchsorted(sorted_knots, x_vals, side='right') - 1
+                            indices = np.clip(indices, 0, len(sorted_knots) - 2)
+                            
+                            for i in range(len(sorted_knots) - 1):
+                                mask = (indices == i)
+                                if counts[i] == 0:
+                                    suggestions.append(f"⚠️ Component **{comp['name']}** has empty interval [{sorted_knots[i]:.2f}, {sorted_knots[i+1]:.2f}]. Consider removing/moving knots.")
+                                elif counts[i] < 5:
+                                    suggestions.append(f"ℹ️ Component **{comp['name']}** has sparse interval [{sorted_knots[i]:.2f}, {sorted_knots[i+1]:.2f}] (<5).")
+                                elif np.any(mask):
+                                    # Calc local Error
+                                    local_err = np.mean(res_abs[mask])
+                                    if local_err > 2.0 * global_rmse and counts[i] > 20:
+                                        suggestions.append(f"💡 Component **{comp['name']}** has high error in interval [{sorted_knots[i]:.2f}, {sorted_knots[i+1]:.2f}] ({local_err:.3f} vs Global {global_rmse:.3f}). Consider adding extensive knots here.")
+                
+                # Check 2b: Knot Suggestions for DIM_2 (Marginal)
+                elif comp['type'] == 'DIM_2':
+                     if df_data is not None and 'residuals' in results:
+                         res_abs = np.abs(results['residuals'])
+                         global_rmse = metrics.get('rmse', 1.0)
+                         
+                         for dim_i, var_name, knots_key in [(0, 'x1_var', 'plot_knots_x1'), (1, 'x2_var', 'plot_knots_x2')]:
+                             if var_name in comp:
+                                 v_name = comp[var_name]
+                                 ks = comp.get(knots_key, comp[f'knots_x{dim_i+1}'])
+                                 s_ks = np.sort(ks)
+                                 
+                                 if len(s_ks) > 1 and v_name in df_data.columns:
+                                     x_vals = df_data[v_name].to_numpy() if isinstance(df_data, pl.DataFrame) else df_data[v_name].values
+                                     
+                                     indices = np.searchsorted(s_ks, x_vals, side='right') - 1
+                                     indices = np.clip(indices, 0, len(s_ks) - 2)
+                                     
+                                     for i in range(len(s_ks) - 1):
+                                         mask = (indices == i)
+                                         if np.sum(mask) > 20:
+                                             local_err = np.mean(res_abs[mask])
+                                             if local_err > 1.8 * global_rmse: # slightly looser threshold for marginal
+                                                  suggestions.append(f"💡 Component **{comp['name']}** (Dim {v_name}) has high marginal error in interval [{s_ks[i]:.2f}, {s_ks[i+1]:.2f}]. Consider adding knots/density along this axis.")
+
+            if low_impact_vars:
+                formatted_list = ", ".join(low_impact_vars)
+                analysis.append(f"ℹ️ **Low Impact Variables**: The following variables have negligible effect: {formatted_list}. Consider removing them.")
+                suggestions.append(f"Consider removing: {formatted_list}")
+                
+        # --- 3. Outlier Detection ---
+        if 'residuals' in results:
+             res = results['residuals']
+             std_res = np.std(res)
+             mean_res = np.mean(res)
+             
+             # Z-score > 3
+             outliers = np.abs(res - mean_res) > 3 * std_res
+             n_outliers = np.sum(outliers)
+             
+             if n_outliers > 0:
+                 pct_out = (n_outliers / len(res)) * 100
+                 analysis.append(f"⚠️ **Outliers**: Detected {n_outliers} points ({pct_out:.2f}%) with residuals > 3σ.")
+                 if pct_out > 5.0:
+                     suggestions.append("High number of outliers detected (>5%). Consider using Robust Regression (Huber/L1) or investigating data quality.")
+        
+        # If no new items added to analysis, imply all good
+        if len(analysis) == start_len:
+            analysis.append("ℹ️ No structural issues detected (e.g. flat variables, empty knot intervals).")
+
+            metrics['n_components'] = len(comps)
 
     return analysis, suggestions
 
@@ -2781,7 +2978,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     
     # Generate Fit Report
     if progress_callback: progress_callback(0.92, "Generating Fit Report...")
-    report_str, report_metrics = generate_fit_report(res, res.x, A, param_mapping, base_P, y_true_arr, w_arr, param_mapping_numba, elapsed_time=elapsed)
+    report_str, report_metrics = generate_fit_report(res, res.x, A, param_mapping, base_P, y_true_arr, w_arr, param_mapping_numba, elapsed_time=elapsed, backend=backend, method=method, options=options)
 
     # Use report_metrics as base
     metrics = report_metrics.copy()
@@ -2825,7 +3022,10 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         'success': res.success,
         'cost': res.cost if hasattr(res, 'cost') else res.fun,
         'metrics': metrics,
-        'residuals': residuals
+        'residuals': residuals,
+        'components': components,
+        'fitted_params': df_results,
+        'P_final': P_final
     }
     analysis_log, suggestions = generate_fit_analysis(temp_res, df_data)
     
@@ -2843,6 +3043,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         'P_final': P_final,
         'figures': figures,
         'residuals': residuals,
+        'components': components,
         'data': df_data, # Return data in case we want to reuse it
         'true_values': true_values
     }
@@ -2850,7 +3051,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
 if __name__ == "__main__":
     run_fitting()
 
-def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param_mapping_numba, elapsed_time=None):
+def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param_mapping_numba, elapsed_time=None, backend=None, method=None, options=None):
     """
     Generates a fit report similar to lmfit.fit_report().
     Calculates statistics and parameter uncertainties.
@@ -3022,20 +3223,25 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
     report = []
     report.append("[Fit Summary]")
     
-    method_name = 'Unknown'
+    display_backend = backend if backend else 'Unknown'
+    display_method = method if method else 'Unknown'
+    
     if isinstance(res, dict):
-        method_name = res.get('method', 'Unknown')
         success = res.get('success', 'Unknown')
     else:
         success = res.success if hasattr(res, 'success') else 'Unknown'
-        if hasattr(res, 'message'):
-            method_name = str(res.message)
             
-    report.append(f"    Method:         {method_name}")
+    report.append(f"    Backend:        {display_backend}")
+    report.append(f"    Method:         {display_method}")
     report.append(f"    Success:        {success}")
     if elapsed_time is not None:
         report.append(f"    Time:           {elapsed_time:.4f} s")
     report.append(f"    Iterations:     {res.nfev if hasattr(res, 'nfev') else 'N/A'}")
+    
+    if options:
+        report.append("\n[Options]")
+        for k, v in options.items():
+            report.append(f"    {k}: {v}")
         
     report.append("\n[Goodness of Fit]")
     report.append(f"    RMSE:           {rmse:.5f}")

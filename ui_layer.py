@@ -525,12 +525,32 @@ def render_results():
             if 'residuals' in results and 'fitting_data' in st.session_state:
                 analysis_text, suggestions = nlf.generate_fit_analysis(results, st.session_state.fitting_data)
                 
-                st.markdown("### Automated Analysis")
-                for line in analysis_text:
-                    st.markdown(line)
+                st.subheader("Automated Analysis")
                 
+                # 1. Fit Analysis (Standard metrics + Model Spec)
+                for item in analysis_text:
+                    # Map emojis to Streamlit calls
+                    if "✅" in item:
+                        st.success(item.replace("✅", ""), icon="✅")
+                    elif "❌" in item:
+                        st.error(item.replace("❌", ""), icon="❌")
+                    elif "⚠️" in item:
+                        st.warning(item.replace("⚠️", ""), icon="⚠️")
+                    elif "💡" in item:
+                         st.info(item.replace("💡", ""), icon="💡")
+                    elif "ℹ️" in item:
+                        st.info(item.replace("ℹ️", ""), icon="ℹ️")
+                    elif "---" in item:
+                         st.markdown("---") # Separators
+                    elif "**" in item and len(item) < 50: # Headers like "Model Specification"
+                         st.markdown(f"##### {item}")
+                    else:
+                        st.markdown(item)
+                
+                # 2. Suggestions (Bottom, Yellow Block)
                 if suggestions:
                     st.warning("**Suggestions for Improvement:**\n\n" + "\n".join([f"- {s}" for s in suggestions]))
+                
                 st.markdown("---")
                 
             if 'fitted_params' in results:
