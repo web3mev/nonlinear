@@ -150,7 +150,7 @@ def calculate_lift_chart_data(y_true, y_pred, w, n_bins=10):
             'mean_actual': np.average(x['y'], weights=x['w']),
             'mean_predicted': np.average(x['pred'], weights=x['w']),
             'sum_weight': x['w'].sum()
-        })
+        }), include_groups=False
     ).reset_index()
     
     agg['lift'] = agg['mean_actual'] / df['y'].mean() # Simple Lift Ratio?
@@ -174,7 +174,7 @@ def calculate_aggregated_metric(df, group_col, y_col, pred_col, w_col):
             'mean_actual': np.average(x[y_col], weights=x[w_col]),
             'mean_predicted': np.average(x[pred_col], weights=x[w_col]),
             'count': len(x)
-        })
+        }), include_groups=False
     ).reset_index()
     
     return agg.sort_values(group_col)

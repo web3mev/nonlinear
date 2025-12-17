@@ -14,6 +14,8 @@ import os
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+# Import stats helpers for benchmarking
+from stats_helper import calculate_gini, calculate_lift_chart_data
 
 COLORS = {
     'darkblue': '#0C2B53',
@@ -2217,6 +2219,20 @@ def run_fitting(backend='scipy_ls', method='trf'):
         cost = res.cost if hasattr(res, 'cost') else res.fun
         print(f"Cost: {cost}")
         P_final = reconstruct_P(res.x, param_mapping, base_P)
+        
+        # Benchmarks
+        # Re-calculate predictions
+        y_log_final = A @ P_final
+        y_pred_final = np.exp(y_log_final)
+        gini = calculate_gini(y_true_arr, y_pred_final, w_arr)
+        print(f"Gini Coefficient: {gini:.4f}")
+        
+        lift_df = calculate_lift_chart_data(y_true_arr, y_pred_final, w_arr, n_bins=10)
+        if not lift_df.empty:
+            top_lift = lift_df.iloc[-1]['lift']
+            bottom_lift = lift_df.iloc[0]['lift']
+            print(f"Lift Chart: Top Decile Lift = {top_lift:.2f}x, Bottom Decile Lift = {bottom_lift:.2f}x")
+        
         print_fitted_parameters(P_final, components)
         plot_fitting_results(P_final, components, df, y_true_arr, true_values)
         print("Plots saved.")
@@ -4793,9 +4809,17 @@ def fit_neural_network(df_data, components, options=None):
     X_std[X_std == 0] = 1.0 # Prevent div by zero
     X_scaled = (X_raw - X_mean) / X_std
     
+    # Target Scaling (Standardization)
+    # NN often fails to regress very small values (like 0.01) without scaling
+    y_mean = np.mean(y_raw)
+    y_std = np.std(y_raw)
+    if y_std == 0: y_std = 1.0
+    
+    y_scaled = (y_raw - y_mean) / y_std
+    
     # Convert to Tensors
     X_tensor = torch.tensor(X_scaled)
-    y_tensor = torch.tensor(y_raw).view(-1, 1)
+    y_tensor = torch.tensor(y_scaled).view(-1, 1) # Use Scaled Target
     w_tensor = torch.tensor(w_raw).view(-1, 1) # Weights
     
     # 3. Define Model structure
@@ -4909,6 +4933,12 @@ def fit_neural_network(df_data, components, options=None):
     
     final_preds /= n_bags
     
+    # Inverse Transform Predictions
+    final_preds = (final_preds * y_std) + y_mean
+    
+    # Clamp negative predictions (Prepayment cannot be negative)
+    final_preds = np.maximum(final_preds, 0.0)
+    
     # Calculate Metrics
     residuals = y_raw - final_preds
     rss = np.sum(w_raw * residuals**2)
@@ -4922,6 +4952,12 @@ def fit_neural_network(df_data, components, options=None):
         'rmse': rmse,
         'mae': mae
     }
+    
+    # Benchmarks
+    gini = calculate_gini(y_raw, final_preds, w_raw)
+    metrics['gini'] = gini
+    
+    lift_data = calculate_lift_chart_data(y_raw, final_preds, w_raw)
     
     # Return structure compatible with render_results
     # Note: NN is "black box", no easy "fitted_params" table.
@@ -4938,5 +4974,7 @@ def fit_neural_network(df_data, components, options=None):
         'y_pred_train': final_preds,
         'features': features,
         'options': options,
-        'diagnostics': {} # Todo: calculate importance
+        'diagnostics': {
+            'lift_chart': lift_data
+        } # Todo: calculate importance
     }
