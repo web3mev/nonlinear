@@ -40,14 +40,16 @@ config = ui.render_sidebar()
 # --- 2. Data Loading & State Initialization ---
 # Initialize Session Keys
 if 'fitting_data' not in st.session_state: st.session_state.fitting_data = None
-if 'params_df' not in st.session_state:
-    st.session_state.params_df = None
+# Check if parameter file selection has changed OR if params_df is missing
+if 'params_df' not in st.session_state or st.session_state.get('last_loaded_param_file') != config['param_file']:
     try:
-        # Initial load
-        if hasattr(config['param_file'], 'read'): # Uploaded file
-             st.session_state.params_df = pd.read_csv(config['param_file'])
-        else: # String path
-             st.session_state.params_df = pd.read_csv(config['param_file'])
+        # Load parameters
+        st.session_state.params_df = pd.read_csv(config['param_file'])
+        st.session_state.last_loaded_param_file = config['param_file']
+        # Clear any existing fitting results to avoid state mismatch
+        if 'fitting_results' in st.session_state:
+            del st.session_state.fitting_results
+        st.toast(f"Loaded {config['param_file']}")
     except Exception as e:
         st.error(f"Error loading parameters: {e}")
 

@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import data_exploration as de
 import data_validation as dv
 import nonlinear_fitting_numba as nlf
+from nonlinear_fitting_numba import HAS_CUPY, HAS_JAX
 import os
 import glob
 import time
@@ -80,6 +81,9 @@ def render_sidebar():
         st.cache_data.clear()
         if 'params_df' in st.session_state:
             del st.session_state.params_df
+            
+    use_log_dim0 = st.sidebar.checkbox("Use Log-Transform for DIM_0_LN (Legacy EXP)", value=False, help="Legacy method. The new bounded approach is 3x faster.")
+    config['dim0_ln_method'] = 'exp' if use_log_dim0 else 'bounded'
     
     # st.markdown("---") removed
     
@@ -100,6 +104,13 @@ def render_sidebar():
     
     selected_backend_label = st.sidebar.selectbox("Fitting Backend", list(backend_options.keys()), index=3)
     config['selected_backend'] = backend_options[selected_backend_label]
+    
+    # GPU Acceleration Backend
+    accel_options = ["None", "CuPy"]
+    if HAS_JAX: accel_options.append("JAX")
+    
+    config['gpu_backend'] = st.sidebar.selectbox("GPU Acceleration Backend", accel_options, index=1 if HAS_CUPY else 0, help="Select the GPU backend for all fitting calculations.")
+    config['use_gpu'] = config['gpu_backend'] != "None"
     
     # Dynamic Method Selection
     method_options = []
@@ -557,7 +568,8 @@ def render_fitting_control(config):
                                 )
                                 result_container['result'] = res
                             except Exception as e:
-                                result_container['error'] = str(e)
+                                import traceback
+                                result_container['error'] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
                         stop_event = threading.Event()
                         result_container = {}
@@ -818,52 +830,6 @@ def render_results(key_prefix=""):
                 # Add PDPs to parameter plots
                  comp_figs = {k: v for k, v in figures.items() if k.startswith("PDP:")}
             
-            # --- Special Handling for Grouped DIM_0 (Key-based Bar Charts) ---
-            if 'params_df' in st.session_state:
-                p_df = st.session_state.params_df
-                # Ensure we have necessary columns
-                if {'Key', 'Calc_Type', 'On_Off_Flag', 'RiskFactor_NM'}.issubset(p_df.columns):
-                    # Filter DIM_0 groups
-                    dim0_groups = p_df[p_df['Calc_Type'] == 'DIM_0'].groupby('Key')
-                    
-                    for key, group in dim0_groups:
-                        # Condition: Size > 1 AND Any On
-                        is_active_group = (group['On_Off_Flag'] == 'Y').any()
-                        if len(group) > 1 and is_active_group:
-                            # Prepare data
-                            chart_rows = []
-                            for _, row in group.iterrows():
-                                val = row.get('RiskFactor_VAL', 0.0) # Default/Fixed Value
-                                label = row.get('X1_Var_NM', 'Unknown')
-                                is_fitted = row['On_Off_Flag'] == 'Y'
-                                
-                                if is_fitted and 'fitted_params' in results:
-                                    # Lookup fitted value
-                                    rf_nm = row['RiskFactor_NM']
-                                    f_df = results['fitted_params']
-                                    if 'Parameter' in f_df.columns:
-                                        matched = f_df[f_df['Parameter'] == rf_nm]
-                                        if not matched.empty:
-                                             val = matched.iloc[0]['Fitted_Value']
-                                    
-                                chart_rows.append({'Variable': label, 'Value': val, 'Type': 'Fitted' if is_fitted else 'Fixed'})
-                                
-                            if chart_rows:
-                                c_df = pd.DataFrame(chart_rows)
-                                # Generate Figure matching style
-                                # Colors: 'liteblue' for Fitted, 'grey' for Fixed
-                                colors = [nlf.COLORS.get('liteblue', 'skyblue') if t == 'Fitted' else nlf.COLORS.get('grey', 'lightgrey') for t in c_df['Type']]
-                                
-                                fig_g, ax_g = plt.subplots(figsize=(6, 4))
-                                ax_g.bar(c_df['Variable'], c_df['Value'], color=colors)
-                                ax_g.set_title(key) # Title is Key
-                                ax_g.set_ylabel("Value")
-                                plt.setp(ax_g.get_xticklabels(), rotation=45, ha='right')
-                                plt.tight_layout()
-                                
-                                # Add to display list
-                                comp_figs[f"Group: {key}"] = fig_g
-
             cols = st.columns(4)
             for i, (name, fig) in enumerate(comp_figs.items()):
                 with cols[i % 4]: display_figure(fig)
@@ -970,41 +936,48 @@ def render_results(key_prefix=""):
                 # Render Single Subplot Figure
                 if plots_data:
                     n_plots = len(plots_data)
-                    n_cols = 2 if n_plots > 1 else 1 # If only 1, standard size
-                    n_rows = (n_plots + 1) // 2 if n_plots > 1 else 1
+                    n_cols = min(4, n_plots) if n_plots > 1 else 1
+                    n_rows = (n_plots + n_cols - 1) // n_cols if n_plots > 1 else 1
                     
-                    # Reduce Font Size context
+                    # Higher DPI and matching figsize to performance charts to avoid blurriness
                     with plt.rc_context({'font.size': 8, 'axes.titlesize': 9, 'axes.labelsize': 8}):
-                         fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 4 * n_rows), dpi=300)
+                         fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows), dpi=400)
                          if n_plots == 1: axes = [axes] # Ensure iterable
                          else: axes = axes.flatten()
                          
                          for i, data in enumerate(plots_data):
                              ax = axes[i]
-                             # Actual: Dark Blue, Solid, Marker
-                             ax.plot(data['x'], data['y_act'], color=nlf.COLORS['darkblue'], linestyle='-', marker='o', markersize=3, label='Actual', linewidth=1)
-                             # Model: Yellow (Gold), Solid, Marker
-                             ax.plot(data['x'], data['y_pred'], color=nlf.COLORS['yellow'], linestyle='-', marker='s', markersize=3, label='Model', linewidth=1)
+                             # Actual: Dark Blue, Solid, Marker 'o' (Matches DIM_1)
+                             ax.plot(data['x'], data['y_act'], color=nlf.COLORS['darkblue'], linestyle='-', marker='o', markersize=4, label='Actual', linewidth=1, alpha=0.9)
+                             # Model: Yellow (Gold), Solid, Marker 'x' (Matches DIM_1)
+                             ax.plot(data['x'], data['y_pred'], color=nlf.COLORS['yellow'], linestyle='-', marker='x', markersize=4, label='Model', linewidth=1, alpha=0.9)
                              
-                             # Volume
+                             # Volume (Secondary Axis) - Dashed Line style (Matches DIM_1)
                              if data['vol_x'] is not None:
                                  ax2 = ax.twinx()
-                                 ax2.bar(data['vol_x'], data['vol_y'], alpha=0.15, color='gray', label='Volume')
-                                 ax2.set_ylabel('Volume', fontsize=7)
+                                 ax2.plot(data['vol_x'], data['vol_y'], color=nlf.COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
                                  ax2.tick_params(axis='y', labelsize=7)
                                  ax2.grid(False) # Turn off grid for volume to avoid clutter
                              
                              ax.set_title(data['title'])
                              ax.set_xlabel(data['xlabel'])
-                             ax.set_ylabel("Mean Response")
-                             ax.legend(loc='upper left', fontsize=7)
-                             ax.grid(True, linestyle=':', alpha=0.5)
+                             # ax.set_ylabel("Mean Response") # Removed for cleaner UI
+                             
+                             # Combine legends
+                             if data['vol_x'] is not None:
+                                 lines1, labels1 = ax.get_legend_handles_labels()
+                                 lines2, labels2 = ax2.get_legend_handles_labels()
+                                 ax.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=7)
+                             else:
+                                 ax.legend(loc='best', fontsize=7)
+                                 
+                             ax.grid(True, linestyle=':', alpha=0.3)
                          
                          # Hide empty subplots
                          for i in range(n_plots, len(axes)):
                              axes[i].axis('off')
                          
-                         plt.tight_layout()
+                         fig.tight_layout()
                          st.pyplot(fig)
                          plt.close(fig)
                          
@@ -1363,21 +1336,41 @@ def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop
     """
     results = []
     
-    # Define candidates
-    candidates = [
-        ("scipy_ls", "trf", "Least Squares (TRF)"),
-        ("scipy_ls", "dogbox", "Least Squares (Dogbox)"),
-        ("scipy_min", "L-BFGS-B", "Minimize (L-BFGS-B)"),
-        ("scipy_min", "SLSQP", "Minimize (SLSQP)"),
-        ("linearized_ls", "lsq_linear", "Linearized LS (Fast)"),
-        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Loss (L-BFGS-B)"),
-        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Global (Basinhopping)", {"global_opt": "basinhopping", "n_iter": 5}),
-        # ("differential_evolution", "Default", "Differential Evolution", {"maxiter": 5}) # Slow, maybe optional?
-    ]
+    gpu_list = ["None"]
+    if nlf.HAS_CUPY: gpu_list.append("CuPy")
+    if nlf.HAS_JAX: gpu_list.append("JAX")
     
-    total = len(candidates)
+    candidate_data = []
+
+    # 1. Scipy LS (Linear only)
+    for gpu in gpu_list:
+        candidate_data.append(("scipy_ls", "trf", f"Scipy LS (TRF) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
+        candidate_data.append(("scipy_ls", "dogbox", f"Scipy LS (Dogbox) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
     
-    for i, candidate in enumerate(candidates):
+    # 2. Scipy Min (Linear, L-BFGS-B)
+    for gpu in gpu_list:
+        candidate_data.append(("scipy_min", "L-BFGS-B", f"Scipy Min (L-BFGS-B) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
+    
+    # 3. Linearized LS (Linear only)
+    for gpu in gpu_list:
+        candidate_data.append(("linearized_ls", "lsq_linear", f"Linearized LS [{gpu}]", "None", {"gpu_backend": gpu}))
+        
+    # 4. NLopt Poisson
+    for gpu in gpu_list:
+        candidate_data.append(("nlopt", "LD_LBFGS", f"NLopt (L-BFGS) Poisson [{gpu}]", "Bounds", {"gpu_backend": gpu, "loss": "poisson"}))
+        
+    # 5. Global
+    for gpu in gpu_list:
+        candidate_data.append(("differential_evolution", "Default", f"Diff. Evol. (Global) [{gpu}]", "Full", {"gpu_backend": gpu, "maxiter": 5})) 
+
+    # 6. Legacy / Specialized
+    candidate_data.append(("poisson_lbfgsb", "L-BFGS-B", "Poisson (Numba CPU)", "Bounds", {}))
+    if nlf.HAS_CUPY:
+        candidate_data.append(("poisson_cupy", "L-BFGS-B", "Poisson (CuPy Native)", "Bounds", {}))
+    
+    total = len(candidate_data)
+    
+    for i, candidate in enumerate(candidate_data):
         if stop_event and stop_event.is_set():
             results.append({
                 "Backend": "User",
@@ -1390,7 +1383,8 @@ def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop
         backend = candidate[0]
         method = candidate[1]
         name = candidate[2]
-        extra_opts = candidate[3] if len(candidate) > 3 else {}
+        constraints = candidate[3]
+        extra_opts = candidate[4] if len(candidate) > 4 else {}
         
         if progress_callback:
             progress_callback(i / total, f"Running {name}...")
@@ -1434,6 +1428,7 @@ def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop
                 "Backend": backend,
                 "Method": method,
                 "Description": name,
+                "Constraints": constraints,
                 "R2": r2,
                 "RMSE": rmse,
                 "Bias": bias,
@@ -1448,6 +1443,7 @@ def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop
             results.append({
                 "Backend": backend,
                 "Description": name,
+                "Constraints": constraints,
                 "Status": status_msg,
                 "Time (s)": elapsed
             })
