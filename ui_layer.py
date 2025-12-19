@@ -82,35 +82,35 @@ def render_sidebar():
         if 'params_df' in st.session_state:
             del st.session_state.params_df
             
-    use_log_dim0 = st.sidebar.checkbox("Use Log-Transform for DIM_0_LN (Legacy EXP)", value=False, help="Legacy method. The new bounded approach is 3x faster.")
-    config['dim0_ln_method'] = 'exp' if use_log_dim0 else 'bounded'
+    # DIM_0_LN always uses 'bounded' mode (linear P = x with positive constraints)
+    # This enables static M optimization for maximum GPU performance
+    config['dim0_ln_method'] = 'bounded'
     
     # st.markdown("---") removed
     
     # 1. Fitting Configuration
     st.sidebar.header("Fitting Configuration")
     
-    backend_options = {
-        "Scipy Least Squares": "scipy_ls",
-        "Scipy Minimize (QP)": "scipy_min",
-        "Linearized Least Squares (Fastest)": "linearized_ls",
-        "Poisson Loss (L-BFGS-B)": "poisson_lbfgsb",
-        "Poisson Loss (CuPy Accelerated)": "poisson_cupy",
-        "NLopt": "nlopt",
-        "Differential Evolution (Global)": "differential_evolution",
-        "Basin Hopping (Global)": "basinhopping",
-        "CuPy (Legacy Placeholder)": "cupy"
-    }
+    # Simplified backend options - only show Poisson Loss
+    # Internal routing based on GPU Acceleration setting
+    backend_display = {"Poisson Loss": "poisson"}
     
-    selected_backend_label = st.sidebar.selectbox("Fitting Backend", list(backend_options.keys()), index=3)
-    config['selected_backend'] = backend_options[selected_backend_label]
+    selected_backend_label = st.sidebar.selectbox("Fitting Backend", list(backend_display.keys()), index=0)
     
-    # GPU Acceleration Backend
-    accel_options = ["None", "CuPy"]
-    if HAS_JAX: accel_options.append("JAX")
+    # Route to appropriate internal backend based on GPU setting
+    gpu_backend = st.sidebar.selectbox("GPU Acceleration Backend", 
+                                       ["None", "CuPy"] + (["JAX"] if HAS_JAX else []), 
+                                       index=1 if HAS_CUPY else 0,
+                                       help="Select the GPU backend for all fitting calculations.")
     
-    config['gpu_backend'] = st.sidebar.selectbox("GPU Acceleration Backend", accel_options, index=1 if HAS_CUPY else 0, help="Select the GPU backend for all fitting calculations.")
-    config['use_gpu'] = config['gpu_backend'] != "None"
+    if gpu_backend == "None":
+        config['selected_backend'] = "poisson_lbfgsb"  # CPU version
+    else:
+        config['selected_backend'] = "poisson_cupy"   # GPU version (handles both CuPy and JAX)
+    
+    config['gpu_backend'] = gpu_backend
+    
+    config['use_gpu'] = gpu_backend != "None"
     
     # Dynamic Method Selection
     method_options = []
@@ -179,6 +179,14 @@ def render_sidebar():
                  st.caption("Note: Global optimization is slower but more robust.")
         else:
             config['global_opt'] = None
+        
+        # Linearized Bilinear Toggle (for GPU static M optimization with DIM_2 components)
+        st.markdown("#### Bilinear Surface")
+        config['mono_2d_linear'] = st.checkbox(
+            "Use Linearized DIM_2 (GPU Optimization)", 
+            value=False, 
+            help="Enables GPU-resident path for models with DIM_2 (bilinear) components. Uses a simplified additive bilinear surface instead of max-dominated. May produce slightly different results."
+        )
 
     # st.markdown("---") removed
     
@@ -1330,37 +1338,21 @@ def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop
     """
     results = []
     
-    gpu_list = ["None"]
-    if nlf.HAS_CUPY: gpu_list.append("CuPy")
-    if nlf.HAS_JAX: gpu_list.append("JAX")
+    # Benchmark 4 Poisson Loss configurations:
+    # - CPU vs CuPy
+    # - Original mono_2d vs Linearized mono_2d (for GPU static M optimization)
+    candidate_data = [
+        # (backend, method, name, constraints, extra_opts)
+        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Loss (CPU)", "Bounds", {"gpu_backend": "None", "mono_2d_linear": False}),
+        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Loss (CPU + Linear DIM_2)", "Bounds", {"gpu_backend": "None", "mono_2d_linear": True}),
+    ]
     
-    candidate_data = []
-
-    # 1. Scipy LS (Linear only)
-    for gpu in gpu_list:
-        candidate_data.append(("scipy_ls", "trf", f"Scipy LS (TRF) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
-        candidate_data.append(("scipy_ls", "dogbox", f"Scipy LS (Dogbox) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
-    
-    # 2. Scipy Min (Linear, L-BFGS-B)
-    for gpu in gpu_list:
-        candidate_data.append(("scipy_min", "L-BFGS-B", f"Scipy Min (L-BFGS-B) [{gpu}]", "Bounds", {"gpu_backend": gpu}))
-    
-    # 3. Linearized LS (Linear only)
-    for gpu in gpu_list:
-        candidate_data.append(("linearized_ls", "lsq_linear", f"Linearized LS [{gpu}]", "None", {"gpu_backend": gpu}))
-        
-    # 4. NLopt Poisson
-    for gpu in gpu_list:
-        candidate_data.append(("nlopt", "LD_LBFGS", f"NLopt (L-BFGS) Poisson [{gpu}]", "Bounds", {"gpu_backend": gpu, "loss": "poisson"}))
-        
-    # 5. Global
-    for gpu in gpu_list:
-        candidate_data.append(("differential_evolution", "Default", f"Diff. Evol. (Global) [{gpu}]", "Full", {"gpu_backend": gpu, "maxiter": 5})) 
-
-    # 6. Legacy / Specialized
-    candidate_data.append(("poisson_lbfgsb", "L-BFGS-B", "Poisson (Numba CPU)", "Bounds", {}))
+    # Add CuPy scenarios if available
     if nlf.HAS_CUPY:
-        candidate_data.append(("poisson_cupy", "L-BFGS-B", "Poisson (CuPy Native)", "Bounds", {}))
+        candidate_data.extend([
+            ("poisson_cupy", "L-BFGS-B", "Poisson Loss (CuPy)", "Bounds", {"mono_2d_linear": False}),
+            ("poisson_cupy", "L-BFGS-B", "Poisson Loss (CuPy + Linear DIM_2)", "Bounds", {"mono_2d_linear": True}),
+        ])
     
     total = len(candidate_data)
     

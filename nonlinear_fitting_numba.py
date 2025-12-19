@@ -46,9 +46,16 @@ except ImportError:
 
 try:
     import cupy as cp
+    # CuPy v11+ moved sparse to cupyx.scipy.sparse
+    try:
+        from cupyx.scipy import sparse as cp_sparse
+    except ImportError:
+        # Fallback for older CuPy versions
+        cp_sparse = cp.sparse
     HAS_CUPY = True
 except ImportError:
     HAS_CUPY = False
+    cp_sparse = None
 
 try:
     import jax
@@ -715,6 +722,77 @@ def compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols):
             
     return Z, Jac
 
+@numba.jit(nopython=True)
+def compute_2d_jacobian_linear(z00, d_u, d_v, d_int, rows, cols):
+    """
+    Linearized 2D bilinear surface with CONSTANT Jacobian (independent of x).
+    This version uses a deterministic accumulation pattern:
+    Z[i,j] = z00 + cumsum_u[i] + cumsum_v[j] + cumsum_int[i,j]
+    
+    Where each d_int[k] affects all cells (i',j') where i'>i and j'>j.
+    This makes dP/dx constant, enabling static M optimization on GPU.
+    """
+    n_params = 1 + (rows - 1) + (cols - 1) + (rows - 1) * (cols - 1)
+    n_grid = rows * cols
+    
+    Z = np.zeros((rows, cols))
+    Jac = np.zeros((n_grid, n_params))
+    
+    # Param indices
+    idx_z00 = 0
+    start_du = 1
+    start_dv = start_du + (rows - 1)
+    start_dint = start_dv + (cols - 1)
+    
+    # Precompute cumulative sums
+    cumsum_u = np.zeros(rows)
+    for i in range(rows - 1):
+        cumsum_u[i + 1] = cumsum_u[i] + d_u[i]
+    
+    cumsum_v = np.zeros(cols)
+    for j in range(cols - 1):
+        cumsum_v[j + 1] = cumsum_v[j] + d_v[j]
+    
+    # Precompute 2D cumulative sum of d_int
+    # d_int is indexed linearly: k = (i-1)*cols + (j-1) for i,j in 1..rows-1, 1..cols-1
+    # cumsum_int[i,j] = sum of all d_int[k'] where k' corresponds to (i',j') with i'<i, j'<j
+    cumsum_int = np.zeros((rows, cols))
+    k = 0
+    for i in range(1, rows):
+        for j in range(1, cols):
+            # Accumulate from top-left corner
+            cumsum_int[i, j] = cumsum_int[i-1, j] + cumsum_int[i, j-1] - cumsum_int[i-1, j-1] + d_int[k]
+            k += 1
+    
+    # Build Z and Jacobian
+    for i in range(rows):
+        for j in range(cols):
+            curr_idx = i * cols + j
+            
+            # Z[i,j] = z00 + cumsum_u[i] + cumsum_v[j] + cumsum_int[i,j]
+            Z[i, j] = z00 + cumsum_u[i] + cumsum_v[j] + cumsum_int[i, j]
+            
+            # Jacobian: dZ[i,j]/dz00 = 1
+            Jac[curr_idx, idx_z00] = 1.0
+            
+            # dZ[i,j]/d_u[m] = 1 for m < i
+            for m in range(i):
+                Jac[curr_idx, start_du + m] = 1.0
+            
+            # dZ[i,j]/d_v[n] = 1 for n < j
+            for n in range(j):
+                Jac[curr_idx, start_dv + n] = 1.0
+            
+            # dZ[i,j]/d_int[k] - need to figure out which d_int contribute
+            # cumsum_int[i,j] includes all d_int for cells (i',j') where i'<=i-1, j'<=j-1
+            # This means d_int[k] affects Z[i,j] if k corresponds to (i',j') with i'<i and j'<j
+            for i2 in range(1, i + 1):
+                for j2 in range(1, j + 1):
+                    k2 = (i2 - 1) * (cols - 1) + (j2 - 1)
+                    Jac[curr_idx, start_dint + k2] = 1.0
+            
+    return Z, Jac
+
 def pack_parameters(components, mode='transform', dim0_ln_method='bounded'):
     """
     Packs parameters into x0.
@@ -1238,7 +1316,7 @@ def get_model_predictions(P, components, A):
     return np.exp(y_log)
 
 @numba.jit(nopython=True)
-def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols, map_modes, direct_indices, direct_ptr):
+def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols, map_modes, direct_indices, direct_ptr, mono_2d_linear=0):
     P = base_P.copy()
     idx_ptr = 0
     n_mappings = len(map_types)
@@ -1306,7 +1384,11 @@ def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols
             d_int = x[idx_ptr : idx_ptr + n_dint]
             idx_ptr += n_dint
             
-            Z, _ = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
+            # Choose between original and linearized mono_2d
+            if mono_2d_linear == 1:
+                Z, _ = compute_2d_jacobian_linear(z00, d_u, d_v, d_int, rows, cols)
+            else:
+                Z, _ = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
             
             # Handle flips
             if mode == 1: # 1/-1
@@ -1336,7 +1418,7 @@ def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols
     return P
 
 @numba.jit(nopython=True)
-def reconstruct_P_and_J_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols, map_modes, direct_indices, direct_ptr):
+def reconstruct_P_and_J_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols, map_modes, direct_indices, direct_ptr, mono_2d_linear=0):
     P = base_P.copy()
     n_params = len(x)
     n_P = len(base_P)
@@ -1420,7 +1502,11 @@ def reconstruct_P_and_J_numba(x, base_P, map_types, map_starts_P, map_counts, ma
             d_v = x[idx_ptr+1+n_du : idx_ptr+1+n_du+n_dv]
             d_int = x[idx_ptr+1+n_du+n_dv : idx_ptr+1+n_du+n_dv+n_dint]
             
-            Z, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
+            # Choose between original and linearized mono_2d
+            if mono_2d_linear == 1:
+                Z, Jac_local = compute_2d_jacobian_linear(z00, d_u, d_v, d_int, rows, cols)
+            else:
+                Z, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
             
             # Handle flips
             if mode == 1: # 1/-1 (Flip V)
@@ -1506,10 +1592,13 @@ def reconstruct_P_and_J_numba(x, base_P, map_types, map_starts_P, map_counts, ma
             
     return P, J
 
-def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
+def get_parameter_jacobian_matrix(x, components, param_mapping, base_P, mono_2d_linear=False):
     """
     Computes dP/dx (sparse matrix M).
     P = M @ x + base_P (roughly, but 2D part is non-linear so M depends on x)
+    
+    Args:
+        mono_2d_linear: If True, use linearized mono_2d with constant Jacobian (for static M GPU path)
     """
     total_P = len(base_P)
     total_x = len(x)
@@ -1574,7 +1663,11 @@ def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
             d_v = x[idx_ptr + 1 + (rows - 1) : idx_ptr + 1 + (rows - 1) + (cols - 1)]
             d_int = x[idx_ptr + 1 + (rows - 1) + (cols - 1) : idx_ptr + n_params_2d]
             
-            _, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
+            # Choose between original and linearized mono_2d
+            if mono_2d_linear:
+                _, Jac_local = compute_2d_jacobian_linear(z00, d_u, d_v, d_int, rows, cols)
+            else:
+                _, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
             
             # Jac_local is (rows*cols, n_params_2d)
             # We need to apply mode flips to Jac_local rows
@@ -1627,7 +1720,7 @@ def residual_func_fast(x, A, param_mapping, base_P, y_true, w, dim0_ln_indices, 
     P = reconstruct_P(x, param_mapping, base_P)
     
     # Check if we are on GPU
-    is_gpu = HAS_CUPY and isinstance(A, cp.sparse.csr_matrix)
+    is_gpu = HAS_CUPY and isinstance(A, cp_sparse.csr_matrix)
     
     if is_gpu:
         P_gpu = cp.array(P)
@@ -1748,7 +1841,7 @@ def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, dim0_ln_indices, 
     P = reconstruct_P(x, param_mapping, base_P)
     
     # Check if we are on GPU
-    is_gpu = HAS_CUPY and isinstance(A, cp.sparse.csr_matrix)
+    is_gpu = HAS_CUPY and isinstance(A, cp_sparse.csr_matrix)
     
     if is_gpu:
         P_gpu = cp.array(P)
@@ -2457,7 +2550,7 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, boun
         P = reconstruct_P(x, param_mapping, base_P)
         
         # Check if we are on GPU
-        is_gpu = HAS_CUPY and isinstance(A, cp.sparse.csr_matrix)
+        is_gpu = HAS_CUPY and isinstance(A, cp_sparse.csr_matrix)
         
         if is_gpu:
             P_gpu = cp.array(P)
@@ -2780,7 +2873,7 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
     bnds = list(zip(bounds[0], bounds[1]))
     
     # Check for CuPy Input -> Redirect to accelerated solver
-    if HAS_CUPY and (isinstance(A, cp.sparse.csr_matrix) or isinstance(A, cp.sparse.coo_matrix)):
+    if HAS_CUPY and (isinstance(A, cp_sparse.csr_matrix) or isinstance(A, cp_sparse.coo_matrix)):
         if options is None: options = {}
         # Ensure gpu_backend key doesn't confuse things, though it shouldn't matter
         return fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds, param_mapping_numba, options, stop_event)
@@ -2807,12 +2900,15 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
         l1_reg = options.get('l1_reg', 0.0)
         l2_reg = options.get('l2_reg', 0.0)
     
+    # Get mono_2d linearization toggle (0=original, 1=linearized for static M)
+    mono_2d_linear = 1 if options.get('mono_2d_linear', False) else 0
+    
     def objective(x):
         if stop_event and stop_event.is_set():
             raise InterruptedError("Fitting stopped by user.")
             
         # 1. Reconstruct P
-        P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+        P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr, mono_2d_linear)
         
         # 2. Compute Gradient
         y_log = A @ P
@@ -2848,7 +2944,7 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
             raise InterruptedError("Fitting stopped by user.")
             
         # 1. Reconstruct P and M
-        P, M = reconstruct_P_and_J_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+        P, M = reconstruct_P_and_J_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr, mono_2d_linear)
         
         # 2. Compute Gradient
         y_log = A @ P
@@ -3157,14 +3253,17 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
     l1_reg = options.get('l1_reg', 0.0)
     l2_reg = options.get('l2_reg', 0.0)
     
+    # Get mono_2d linearization toggle (required for static M with mono_2d components)
+    mono_2d_linear = options.get('mono_2d_linear', False)
+    mono_2d_linear_flag = 1 if mono_2d_linear else 0
+    
     # Transfer data to GPU
     # Use sparse matrix for A
-    if isinstance(A, cp.sparse.spmatrix):
+    if isinstance(A, cp_sparse.spmatrix):
         A_gpu = A
     else:
-        A_gpu = cp.sparse.csr_matrix(A)
+        A_gpu = cp_sparse.csr_matrix(A)
         
-    y_true_gpu = y_true if isinstance(y_true, cp.ndarray) else cp.array(y_true)
     y_true_gpu = y_true if isinstance(y_true, cp.ndarray) else cp.array(y_true)
     w_gpu = w if isinstance(w, cp.ndarray) else cp.array(w)
     
@@ -3176,15 +3275,33 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         l1_reg = l1_reg / float(w_mean)
         l2_reg = l2_reg / float(w_mean)
     
-    # Check for EXP type (Type 4) -> If present, M is dynamic. Else static.
+    # Check which component types prevent static M optimization:
+    # - Type 3 (mono_2d): Dynamic M UNLESS mono_2d_linear=True (linearized mono_2d has constant Jacobian)
+    # - Type 4 (EXP): Always dynamic M = diag(exp(x))
+    has_mono_2d = np.any(n_map_types == 3)
     has_exp = np.any(n_map_types == 4)
-    use_static_M = not has_exp
+    
+    # Static M is possible if:
+    # - No EXP components (type 4)
+    # - AND (no mono_2d OR mono_2d_linear is enabled)
+    use_static_M = not has_exp and (not has_mono_2d or mono_2d_linear)
     
     M_gpu = None
+    base_P_gpu = None
     if use_static_M:
-         # Precompute M once
-         M_cpu = get_parameter_jacobian_matrix(x0, components, param_mapping, base_P)
-         M_gpu = cp.sparse.csr_matrix(M_cpu)
+         print(f"[CuPy] Using OPTIMIZED GPU-resident path (Static M)")
+         if mono_2d_linear and has_mono_2d:
+             print(f"       (mono_2d_linear=True enables static M for DIM_2 components)")
+         # Precompute M once (with linearized mono_2d if enabled)
+         M_cpu = get_parameter_jacobian_matrix(x0, components, param_mapping, base_P, mono_2d_linear=mono_2d_linear)
+         M_gpu = cp_sparse.csr_matrix(M_cpu)
+         # Transfer base_P to GPU (contains fixed parameter values)
+         base_P_gpu = cp.array(base_P)
+    else:
+         reasons = []
+         if has_exp: reasons.append("EXP components")
+         if has_mono_2d and not mono_2d_linear: reasons.append("mono_2d (set mono_2d_linear=True to use static M)")
+         print(f"[CuPy] Using FALLBACK CPU/GPU hybrid path (Dynamic M due to: {', '.join(reasons)})")
 
     def objective(x):
         if stop_event and stop_event.is_set():
@@ -3193,7 +3310,24 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         if use_static_M:
             # Fully GPU Resident Path
             x_gpu = cp.array(x)
-            P_gpu = M_gpu @ x_gpu
+            # P = M @ x + base_P (base_P contains fixed parameter values)
+            P_gpu = M_gpu @ x_gpu + base_P_gpu
+            
+            # DEBUG: Verify P computation matches CPU method
+            if False:  # Set to True for debugging
+                P_cpu_check = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr, mono_2d_linear_flag)
+                P_gpu_check = cp.asnumpy(P_gpu)
+                diff = np.abs(P_cpu_check - P_gpu_check)
+                max_diff = np.max(diff)
+                if max_diff > 1e-10:
+                    max_idx = np.argmax(diff)
+                    print(f"WARNING: P mismatch! Max diff: {max_diff:.6f} at P[{max_idx}]: CPU={P_cpu_check[max_idx]:.6f}, GPU={P_gpu_check[max_idx]:.6f}")
+                    # Show top 5 mismatches
+                    top_indices = np.argsort(diff)[-5:][::-1]
+                    for idx in top_indices:
+                        if diff[idx] > 1e-10:
+                            print(f"  P[{idx}]: CPU={P_cpu_check[idx]:.6f}, GPU={P_gpu_check[idx]:.6f}, diff={diff[idx]:.6f}")
+
             
             y_log_gpu = A_gpu @ P_gpu
             
@@ -3221,9 +3355,9 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
             return float(loss_gpu)
             
         else:
-            # Hybrid Path (Legacy for EXP types)
+            # Hybrid Path (Legacy for EXP types or original mono_2d)
             # 1. Reconstruct P on CPU (Numba)
-            P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+            P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr, mono_2d_linear_flag)
             
             # 2. Transfer P to GPU
             P_gpu = cp.array(P)
@@ -3264,8 +3398,8 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
             # Fully GPU resident path
             x_gpu = cp.array(x)
             
-            # 1. P = M @ x
-            P_gpu = M_gpu @ x_gpu
+            # 1. P = M @ x + base_P
+            P_gpu = M_gpu @ x_gpu + base_P_gpu
             
             # 2. Gradient on GPU
             y_log_gpu = A_gpu @ P_gpu
@@ -3316,7 +3450,7 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
 
         # Fallback to Hybrid CPU/GPU
         # 1. Reconstruct P and M on CPU
-        P, M = reconstruct_P_and_J_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
+        P, M = reconstruct_P_and_J_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr, mono_2d_linear_flag)
         
         # 2. Transfer P to GPU
         P_gpu = cp.array(P)
@@ -3413,7 +3547,7 @@ def fit_scipy_ls(x0, A, param_mapping, base_P, y_true, w, components, bounds, pa
     alpha = options.get('alpha', 0.0) if options else 0.0
     l1_ratio = options.get('l1_ratio', 0.0) if options else 0.0
     
-    is_gpu = HAS_CUPY and isinstance(A, cp.sparse.csr_matrix)
+    is_gpu = HAS_CUPY and isinstance(A, cp_sparse.csr_matrix)
     gpu_backend = options.get('gpu_backend', 'CuPy' if is_gpu else 'None')
     is_jax = (gpu_backend == 'JAX' and HAS_JAX)
     
@@ -4653,7 +4787,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     if use_gpu:
         if gpu_backend == 'CuPy' and HAS_CUPY:
             print("Moving data to GPU (CuPy) for universal acceleration...")
-            A = cp.sparse.csr_matrix(A)
+            A = cp_sparse.csr_matrix(A)
             y_true_arr = cp.array(y_true_arr)
             w_arr = cp.array(w_arr)
         elif gpu_backend == 'JAX' and HAS_JAX:

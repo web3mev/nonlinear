@@ -11,6 +11,12 @@ def run_benchmark_api(df_data, df_params, progress_callback=None, stop_event=Non
     """
     Runs the benchmark suite using provided data and parameters.
     Returns a pandas DataFrame of results.
+    
+    Benchmarks 4 configurations:
+    - Poisson Loss (CPU): Original mono_2d, CPU backend
+    - Poisson Loss (CuPy): Original mono_2d, GPU backend
+    - Poisson Loss (CPU + Linear DIM_2): Linearized mono_2d, CPU backend
+    - Poisson Loss (CuPy + Linear DIM_2): Linearized mono_2d, GPU backend (Static M path)
     """
     if progress_callback: progress_callback(0, "Initializing...")
     
@@ -35,22 +41,19 @@ def run_benchmark_api(df_data, df_params, progress_callback=None, stop_event=Non
         
     A = nlf.precompute_basis(components, df_data)
     
-    # 2. Define Scenarios
+    # 2. Define Scenarios: Poisson Loss with 4 combinations
+    # - CPU vs CuPy
+    # - Original mono_2d vs Linearized mono_2d (for GPU static M optimization)
     scenarios = [
-        {'backend': 'scipy_ls', 'method': 'trf', 'name': 'Scipy LS (TRF)'},
-        {'backend': 'scipy_ls', 'method': 'dogbox', 'name': 'Scipy LS (Dogbox)'},
-        {'backend': 'scipy_min', 'method': 'trust-constr', 'name': 'Scipy Min (Trust-Constr)'},
-        {'backend': 'scipy_min', 'method': 'SLSQP', 'name': 'Scipy Min (SLSQP)'},
-        {'backend': 'scipy_min', 'method': 'L-BFGS-B', 'name': 'Scipy Min (L-BFGS-B)'},
-        {'backend': 'linearized_ls', 'method': 'lsq_linear', 'name': 'Linearized LS'},
-        {'backend': 'poisson_lbfgsb', 'method': 'L-BFGS-B', 'name': 'Poisson Loss (L-BFGS-B)'},
+        {'backend': 'poisson_lbfgsb', 'method': 'L-BFGS-B', 'name': 'Poisson Loss (CPU)', 'mono_2d_linear': False},
+        {'backend': 'poisson_cupy', 'method': 'L-BFGS-B', 'name': 'Poisson Loss (CuPy)', 'mono_2d_linear': False},
+        {'backend': 'poisson_lbfgsb', 'method': 'L-BFGS-B', 'name': 'Poisson Loss (CPU + Linear DIM_2)', 'mono_2d_linear': True},
+        {'backend': 'poisson_cupy', 'method': 'L-BFGS-B', 'name': 'Poisson Loss (CuPy + Linear DIM_2)', 'mono_2d_linear': True},
     ]
     
-    # if nlf.HAS_CUPY:
-    #     scenarios.append({'backend': 'poisson_cupy', 'method': 'L-BFGS-B', 'name': 'Poisson (CuPy)'})
-    
-    if nlf.HAS_NLOPT:
-        scenarios.append({'backend': 'nlopt', 'method': 'LD_SLSQP', 'name': 'NLopt (LD_SLSQP)'})
+    # Filter out CuPy scenarios if CuPy is not available
+    if not nlf.HAS_CUPY:
+        scenarios = [sc for sc in scenarios if sc['backend'] != 'poisson_cupy']
     
     results = []
     
@@ -66,10 +69,8 @@ def run_benchmark_api(df_data, df_params, progress_callback=None, stop_event=Non
         progress = 10 + int((i / n_scenarios) * 85)
         if progress_callback: progress_callback(progress, f"Running {sc['name']}...")
         
-        # Pack
-        pack_mode = 'transform'
-        if sc['backend'] in ['scipy_min', 'nlopt', 'cupy']:
-            pack_mode = 'direct'
+        # Pack parameters
+        pack_mode = 'transform'  # Always use transform for Poisson backends
         x0, bounds, param_mapping, base_P, param_mapping_numba = nlf.pack_parameters(components, mode=pack_mode)
         
         start_time = time.time()
@@ -77,34 +78,25 @@ def run_benchmark_api(df_data, df_params, progress_callback=None, stop_event=Non
         cost = np.nan
         success = False
         
+        # Get mono_2d_linear setting for this scenario
+        mono_2d_linear = sc.get('mono_2d_linear', False)
+        options = {'mono_2d_linear': mono_2d_linear, 'maxiter': 500, 'ftol': 1e-5}
+        
         try:
-             # Run Fit (Direct calls to avoid API overhead/threading inside threading)
-             # But calling internal functions is fine.
-             if sc['backend'] == 'scipy_ls':
-                res = scipy.optimize.least_squares(
-                    nlf.residual_func_fast, x0, jac=nlf.jacobian_func_fast, bounds=bounds,
-                    args=(A, param_mapping, base_P, y_true_arr, w_arr, 0.0, 0.5),
-                    verbose=0, method=sc['method'], x_scale='jac'
+            if sc['backend'] == 'poisson_lbfgsb':
+                res = nlf.fit_poisson_lbfgsb(
+                    x0, A, param_mapping, base_P, y_true_arr, w_arr, 
+                    components, bounds, param_mapping_numba, options=options
                 )
                 success = res.success
-                cost = res.cost
-             elif sc['backend'] == 'scipy_min':
-                opts = {'maxiter': 500, 'ftol': 1e-5}
-                res = nlf.fit_scipy_minimize(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, method=sc['method'], options=opts)
+                cost = res.fun
+            elif sc['backend'] == 'poisson_cupy':
+                res = nlf.fit_poisson_cupy(
+                    x0, A, param_mapping, base_P, y_true_arr, w_arr, 
+                    components, bounds, param_mapping_numba, options=options
+                )
                 success = res.success
                 cost = res.fun
-             elif sc['backend'] == 'linearized_ls':
-                res = nlf.fit_linearized_ls(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba)
-                success = res.success
-                cost = res.cost
-             elif sc['backend'] == 'poisson_lbfgsb':
-                 res = nlf.fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba)
-                 success = res.success
-                 cost = res.fun
-             elif sc['backend'] == 'nlopt':
-                 res = nlf.fit_nlopt(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, method=sc['method'])
-                 success = (res.status > 0)
-                 cost = res.fun
              
         except Exception as e:
             print(f"Benchmark error {sc['name']}: {e}")
