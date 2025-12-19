@@ -705,7 +705,7 @@ def render_results(key_prefix=""):
                      resid = results['residuals']
                      
                      # 1. Actual vs Pred
-                     fig1, ax1 = plt.subplots(figsize=(6,4), dpi=100)
+                     fig1, ax1 = plt.subplots(figsize=(6,4), dpi=200)
                      ax1.scatter(y, pred, alpha=0.3, s=10)
                      ax1.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
                      ax1.set_xlabel("Actual")
@@ -715,7 +715,7 @@ def render_results(key_prefix=""):
                      plt.close(fig1)
 
                      # 2. Res vs Pred
-                     fig2, ax2 = plt.subplots(figsize=(6,4), dpi=100)
+                     fig2, ax2 = plt.subplots(figsize=(6,4), dpi=200)
                      ax2.scatter(pred, resid, alpha=0.3, s=10)
                      ax2.axhline(0, color='r', linestyle='--')
                      ax2.set_xlabel("Predicted")
@@ -725,14 +725,14 @@ def render_results(key_prefix=""):
                      plt.close(fig2)
                      
                      # 3. Hist
-                     fig3, ax3 = plt.subplots(figsize=(6,4), dpi=100)
+                     fig3, ax3 = plt.subplots(figsize=(6,4), dpi=200)
                      ax3.hist(resid, bins=30, edgecolor='k', alpha=0.7)
                      ax3.set_title("Histogram of Residuals")
                      figures['Histogram of Residuals'] = fig3
                      plt.close(fig3)
                      
                      # 4. QQ
-                     fig4, ax4 = plt.subplots(figsize=(6,4), dpi=100)
+                     fig4, ax4 = plt.subplots(figsize=(6,4), dpi=200)
                      import scipy.stats as stats
                      stats.probplot(resid, dist="norm", plot=ax4)
                      ax4.set_title("Q-Q Plot")
@@ -755,7 +755,7 @@ def render_results(key_prefix=""):
                                  sorted_feats = [feats[i] for i in sorted_idx]
                                  sorted_gain = [imp['gain'][i] for i in sorted_idx]
                                  
-                                 fig_imp, ax_imp = plt.subplots(figsize=(8, len(feats)*0.3 + 2), dpi=100)
+                                 fig_imp, ax_imp = plt.subplots(figsize=(8, len(feats)*0.3 + 2), dpi=200)
                                  ax_imp.barh(sorted_feats, sorted_gain, color=nlf.COLORS.get('liteblue', 'skyblue'))
                                  ax_imp.set_title("Feature Importance (Gain)")
                                  ax_imp.set_xlabel("Gain")
@@ -770,7 +770,7 @@ def render_results(key_prefix=""):
                                  try:
                                      # Need shap installed for summary_plot
                                      import shap
-                                     fig_shap = plt.figure(figsize=(8, 6), dpi=100)
+                                     fig_shap = plt.figure(figsize=(8, 6), dpi=200)
                                      shap.summary_plot(shap_data['shap_values'], shap_data['X_shap'], show=False)
                                      # summary_plot modifies current axis or creates one. 
                                      # It doesn't return fig. We captured it in fig_shap context usually?
@@ -785,7 +785,7 @@ def render_results(key_prefix=""):
                          # Let's add them to figures dict prefixed with "PDP: "
                          if 'pdp' in diag:
                              for feat, data in diag['pdp'].items():
-                                 fig_pdp, ax_pdp = plt.subplots(figsize=(6,4), dpi=100)
+                                 fig_pdp, ax_pdp = plt.subplots(figsize=(6,4), dpi=200)
                                  ax_pdp.plot(data['x'], data['y'], color=nlf.COLORS.get('darkblue', 'blue'), linewidth=2)
                                  ax_pdp.set_title(f"PDP: {feat}")
                                  ax_pdp.set_xlabel(feat)
@@ -933,54 +933,48 @@ def render_results(key_prefix=""):
                          'xlabel': col.title()
                      })
                 
-                # Render Single Subplot Figure
+                # Render Individual Plots in Columns
                 if plots_data:
                     n_plots = len(plots_data)
-                    n_cols = min(4, n_plots) if n_plots > 1 else 1
-                    n_rows = (n_plots + n_cols - 1) // n_cols if n_plots > 1 else 1
+                    n_cols = min(3, n_plots)
+                    cols = st.columns(n_cols)
                     
-                    # Higher DPI and matching figsize to performance charts to avoid blurriness
-                    with plt.rc_context({'font.size': 8, 'axes.titlesize': 9, 'axes.labelsize': 8}):
-                         fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows), dpi=400)
-                         if n_plots == 1: axes = [axes] # Ensure iterable
-                         else: axes = axes.flatten()
-                         
-                         for i, data in enumerate(plots_data):
-                             ax = axes[i]
-                             # Actual: Dark Blue, Solid, Marker 'o' (Matches DIM_1)
-                             ax.plot(data['x'], data['y_act'], color=nlf.COLORS['darkblue'], linestyle='-', marker='o', markersize=4, label='Actual', linewidth=1, alpha=0.9)
-                             # Model: Yellow (Gold), Solid, Marker 'x' (Matches DIM_1)
-                             ax.plot(data['x'], data['y_pred'], color=nlf.COLORS['yellow'], linestyle='-', marker='x', markersize=4, label='Model', linewidth=1, alpha=0.9)
-                             
-                             # Volume (Secondary Axis) - Dashed Line style (Matches DIM_1)
-                             if data['vol_x'] is not None:
-                                 ax2 = ax.twinx()
-                                 ax2.plot(data['vol_x'], data['vol_y'], color=nlf.COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
-                                 ax2.tick_params(axis='y', labelsize=7)
-                                 ax2.grid(False) # Turn off grid for volume to avoid clutter
-                             
-                             ax.set_title(data['title'])
-                             ax.set_xlabel(data['xlabel'])
-                             # ax.set_ylabel("Mean Response") # Removed for cleaner UI
-                             
-                             # Combine legends
-                             if data['vol_x'] is not None:
-                                 lines1, labels1 = ax.get_legend_handles_labels()
-                                 lines2, labels2 = ax2.get_legend_handles_labels()
-                                 ax.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=7)
-                             else:
-                                 ax.legend(loc='best', fontsize=7)
-                                 
-                             ax.grid(True, linestyle=':', alpha=0.3)
-                         
-                         # Hide empty subplots
-                         for i in range(n_plots, len(axes)):
-                             axes[i].axis('off')
-                         
-                         fig.tight_layout()
-                         st.pyplot(fig)
-                         plt.close(fig)
-                         
+                    for i, data in enumerate(plots_data):
+                        with cols[i % n_cols]:
+                            # Create individual figure (High quality, native size)
+                            fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+                            
+                            # Actual: Dark Blue, Solid, Marker 'o' (Matches Performance Charts)
+                            ax.plot(data['x'], data['y_act'], color=nlf.COLORS['darkblue'], linestyle='-', marker='o', markersize=4, label='Actual', linewidth=1.5, alpha=0.9)
+                            # Model: Yellow (Gold), Solid, Marker 'x' (Matches Performance Charts)
+                            ax.plot(data['x'], data['y_pred'], color=nlf.COLORS['yellow'], linestyle='-', marker='x', markersize=4, label='Model', linewidth=1.5, alpha=0.9)
+                            
+                            # Volume (Secondary Axis) - Dashed Line style
+                            if data['vol_x'] is not None:
+                                ax2 = ax.twinx()
+                                ax2.plot(data['vol_x'], data['vol_y'], color=nlf.COLORS['grey'], linestyle='--', label='Balance', alpha=0.6)
+                                ax2.tick_params(axis='y', labelsize=8)
+                                ax2.grid(False) # Turn off grid for volume
+                                # Use scientific notation for large volumes if needed
+                                ax2.yaxis.get_offset_text().set_fontsize(8)
+                            
+                            ax.set_title(data['title'], fontsize=11, fontweight='bold')
+                            ax.set_xlabel(data['xlabel'], fontsize=10)
+                            ax.tick_params(axis='both', labelsize=9)
+                            ax.grid(True, linestyle=':', alpha=0.3)
+                            
+                            # Combine legends
+                            if data['vol_x'] is not None:
+                                lines1, labels1 = ax.get_legend_handles_labels()
+                                lines2, labels2 = ax2.get_legend_handles_labels()
+                                ax.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=8)
+                            else:
+                                ax.legend(loc='best', fontsize=8)
+                            
+                            fig.tight_layout()
+                            st.pyplot(fig)
+                            # Explicitly clear/close to free memory
+                            plt.close(fig)
                 else:
                     st.info("No validation plots available (missing data or columns).")
 
