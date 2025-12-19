@@ -41,6 +41,7 @@ config = ui.render_sidebar()
 # Initialize Session Keys
 if 'fitting_data' not in st.session_state: st.session_state.fitting_data = None
 if 'params_df' not in st.session_state:
+    st.session_state.params_df = None
     try:
         # Initial load
         if hasattr(config['param_file'], 'read'): # Uploaded file
@@ -58,7 +59,7 @@ if df_loaded is not None:
 
 # --- 3. UI Sections (Tabs) ---
 # --- 3. UI Sections (Tabs) ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Data Exploration", "Model Specification", "Model Fitting", "Advanced", "Machine Learning Fitting", "Neural Network Fitting", "Documentation"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["Data Exploration", "Model Specification", "Model Fitting", "Advanced", "Machine Learning Fitting", "Neural Network Fitting", "Benchmark", "Documentation"])
 
 with tab1:
     ui.render_exploration()
@@ -81,5 +82,8 @@ with tab6:
     ui.render_nn_fitting(config)
 
 with tab7:
+    ui.render_benchmark_section(config)
+
+with tab8:
     ui.render_documentation()
 

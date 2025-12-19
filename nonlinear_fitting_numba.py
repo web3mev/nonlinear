@@ -1,5 +1,9 @@
 import pandas as pd
-import polars as pl
+try:
+    import polars as pl
+    HAS_POLARS = True
+except ImportError:
+    HAS_POLARS = False
 import numpy as np
 import scipy.optimize
 import scipy.sparse
@@ -11,9 +15,13 @@ import matplotlib.pyplot as plt
 import numba
 import numexpr as ne
 import os
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 # Import stats helpers for benchmarking
 from stats_helper import calculate_gini, calculate_lift_chart_data
 
@@ -104,14 +112,23 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             # Plot knots not really applicable for DIM_0 (scalar)
             
         elif calc_type == 'DIM_1':
-            comp['knots'] = group['X1_Var_Val'].values
-            comp['initial_values'] = group['RiskFactor_VAL'].values
-            comp['fixed'] = group['Fixed'].values == 'Y'
-            comp['keys'] = group['Key'].values
+            # Force sorted unique knots for stability
+            # Group by X1_Var_Val to aggregate
+            g_sorted = group.sort_values('X1_Var_Val')
+            # Drop duplicates on knot value? 
+            # If duplicates exist, we should probably take the first or mean. 
+            # Linear interpolation requires unique knots.
+            g_unique = g_sorted.drop_duplicates(subset='X1_Var_Val', keep='first')
+            
+            comp['knots'] = g_unique['X1_Var_Val'].values
+            comp['initial_values'] = g_unique['RiskFactor_VAL'].values
+            comp['fixed'] = g_unique['Fixed'].values == 'Y'
+            comp['keys'] = g_unique['Key'].values
             comp['n_params'] = len(comp['knots'])
             
             # Plotting Knots (All)
-            comp['plot_knots'] = group_full['X1_Var_Val'].values
+            # Should also be unique/sorted
+            comp['plot_knots'] = np.sort(np.unique(group_full['X1_Var_Val'].values))
             
         elif calc_type == 'DIM_2':
             # Fitting Knots
@@ -144,7 +161,48 @@ def load_model_spec(csv_path='parameters.csv', df=None):
             
         components.append(comp)
         
-    return components
+    # Post-processing to group DIM_0 params with key ending in _LN
+    final_components = []
+    
+    # We will use a dict to collect groups: key -> list of indices in components
+    ln_groups = {}
+    
+    # Indices to skip (because they were merged)
+    skip_indices = set()
+    
+    for i, comp in enumerate(components):
+        if comp['type'] == 'DIM_0' and 'key' in comp and comp['key'] and str(comp['key']).endswith('_LN'):
+            key = comp['key']
+            if key not in ln_groups:
+                ln_groups[key] = []
+            ln_groups[key].append(i)
+            
+    # Process groups
+    for key, indices in ln_groups.items():
+        if len(indices) > 0: # Group even if single item? Logic implies multiple additive terms.
+            # Create a merged component
+            # We take the "common" attributes from the first one
+            sub_components = []
+            for idx in indices:
+                sub_components.append(components[idx])
+                skip_indices.add(idx)
+                
+            merged_comp = {
+                'name': key, # Use the Key as the name for the group
+                'type': 'DIM_0_LN',
+                'sub_model': sub_components[0]['sub_model'],
+                'sub_components': sub_components,
+                'n_params': len(sub_components),
+                'key': key
+            }
+            final_components.append(merged_comp)
+            
+    # Add non-merged components
+    for i, comp in enumerate(components):
+        if i not in skip_indices:
+            final_components.append(comp)
+            
+    return final_components
 
 # --- 2. Data Generation ---
 def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
@@ -157,6 +215,25 @@ def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
     
     generated_vars = set()
     
+    # 1. Pre-generate DIM_0_LN variables as groups (Dirichlet)
+    for comp in components:
+        if comp['type'] == 'DIM_0_LN':
+            # Collect variables in this group
+            sub_vars = [sub['x1_var'] for sub in comp['sub_components']]
+            
+            # Check if any already generated (shouldn't happen if mutually exclusive groups)
+            if any(v in generated_vars for v in sub_vars):
+                continue
+                
+            # Generate independent distributions (breaking sum-to-1 constraint)
+            # Use Beta(2, 2) for a bell-shape in [0, 1] or Uniform
+            # "no constraint on ppurpp" -> Independent Uniform is the strongest proof.
+            for i, var_name in enumerate(sub_vars):
+                # data[var_name] = rng.uniform(0.0, 1.0, n_samples)
+                # Let's use Beta to make it slightly realistic (proportions) but independent
+                data[var_name] = rng.beta(2, 5, n_samples)
+                generated_vars.add(var_name)
+    
     for comp in components:
 
         # Determine which variables and knot keys to check based on component type
@@ -166,6 +243,10 @@ def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
         elif comp['type'] == 'DIM_2':
             vars_to_check.append((comp['x1_var'], 'knots_x1'))
             vars_to_check.append((comp['x2_var'], 'knots_x2'))
+        elif comp['type'] == 'DIM_0_LN':
+            # Add all sub-component variables (though likely already generated)
+            for sub in comp['sub_components']:
+                vars_to_check.append((sub['x1_var'], None))
         else:
             # DIM_0 or others
             vars_to_check.append((comp['x1_var'], None))
@@ -295,6 +376,30 @@ def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
             y_log += lin_spl(data[comp['x1_var']], comp['knots'], vals)
             true_values.append(vals)
             
+        elif comp['type'] == 'DIM_0_LN':
+            # Handle DIM_0_LN group
+            # Generate random coefficients (betas)
+            n_subs = len(comp['sub_components'])
+            # Random coefficients from LogNormal to ensure positivity
+            # exp(N(0, 0.5)) -> approx median 1.0, spread positive
+            # This simulates beta ~ Normal, coeff = exp(beta)
+            vals = rng.lognormal(mean=0.0, sigma=0.5, size=n_subs)
+            # No normalization (vals /= vals.sum() removed)
+            
+            # Compute contribution: ln(sum(beta_i * x_i))
+            term_sum = np.zeros(n_samples)
+            
+            for i, sub in enumerate(comp['sub_components']):
+                # Assuming data[x] exists (generated earlier)
+                x_data = data[sub['x1_var']]
+                term_sum += vals[i] * x_data
+                
+            # Avoid log(0)
+            term_sum = np.maximum(term_sum, 1e-8)
+            y_log += np.log(term_sum)
+            
+            true_values.append(vals)
+            
         elif comp['type'] == 'DIM_2':
             if np.all(comp['fixed']):
                 vals = comp['initial_values']
@@ -363,17 +468,19 @@ def generate_data(components, n_samples=int(1e6), seed=42, t=1.0):
     # Ensure y is positive (clip to small epsilon for log safety)
     y_noisy = np.maximum(y_noisy, 1e-6)
     
-    # Create Polars DataFrame
-    # data is a dict of numpy arrays, which Polars handles efficiently
-    df = pl.DataFrame(data)
-    
-    # Add y, w, and balance
-    # Polars is immutable, so we use with_columns
-    df = df.with_columns([
-        pl.Series('y', y_noisy),
-        pl.Series('w', w),
-        pl.Series('balance', balance)
-    ])
+    # Create DataFrame (Polars if available, else Pandas)
+    if HAS_POLARS:
+        df = pl.DataFrame(data)
+        df = df.with_columns([
+            pl.Series('y', y_noisy),
+            pl.Series('w', w),
+            pl.Series('balance', balance)
+        ])
+    else:
+        df = pd.DataFrame(data)
+        df['y'] = y_noisy
+        df['w'] = w
+        df['balance'] = balance
     
     return df, true_values
 
@@ -386,6 +493,21 @@ def precompute_basis(components, df):
         if comp['type'] == 'DIM_0':
             col = df[comp['x1_var']].to_numpy().reshape(-1, 1)
             basis_matrices.append(scipy.sparse.csr_matrix(col))
+            
+        elif comp['type'] == 'DIM_0_LN':
+            sub_mats = []
+            for sub in comp['sub_components']:
+                # Handle Polars/Pandas
+                if HAS_POLARS and isinstance(df, pl.DataFrame):
+                    vals = df[sub['x1_var']].to_numpy()
+                else:
+                    vals = df[sub['x1_var']].values
+                col = vals.reshape(-1, 1)
+                sub_mats.append(scipy.sparse.csr_matrix(col))
+            
+            if sub_mats:
+                mat = scipy.sparse.hstack(sub_mats, format='csr')
+                basis_matrices.append(mat)
             
         elif comp['type'] == 'DIM_1':
             x = df[comp['x1_var']].to_numpy()
@@ -531,19 +653,23 @@ def compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols):
 
 def pack_parameters(components, mode='transform'):
     """
-    mode: 'transform' (default) - uses deltas for monotonicity (for bounds-constrained solvers)
-          'direct' - uses raw values (for linearly constrained solvers like SLSQP/trust-constr)
+    Packs parameters into x0.
+    Returns:
+        x0: 1D array of initial values
+        bounds: (lower_bounds, upper_bounds) tuple or None
+        param_mapping: List detailing how to map x back to P
+        base_P: Static list of parameter values (holds fixed values)
+        param_mapping_numba: Tuple of arrays for Numba-compatible reconstruction
     """
     x0 = []
     bounds_lower = []
     bounds_upper = []
-    param_mapping = [] 
-    
-    total_params = sum(c['n_params'] for c in components)
+    param_mapping = []
     base_P = []
+    
     current_P_idx = 0
     
-    for i, comp in enumerate(components):
+    for comp in components:
         start_P = current_P_idx
         
         if comp['type'] == 'DIM_0':
@@ -557,9 +683,37 @@ def pack_parameters(components, mode='transform'):
                 bounds_upper.append(np.inf)
                 param_mapping.append(('direct', [start_P]))
                 
+        elif comp['type'] == 'DIM_0_LN':
+            # Handle group of params
+            sub_comps = comp['sub_components']
+            n_sub = len(sub_comps)
+            for j, sub in enumerate(sub_comps):
+                val = sub['initial_value']
+                fixed = sub['fixed']
+                base_P.append(val if fixed else 0.0)
+                
+                if not fixed:
+                    # Logic: If initial value is <= 0 use small epsilon
+                    if val <= 1e-6:
+                        val = 0.1 
+                        
+                    # Log-Space Parameterization
+                    # We optimize alpha = ln(val)
+                    # val = exp(alpha)
+                    val_log = np.log(val)
+                    
+                    x0.append(val_log)
+                    # Log-space is unconstrained (-inf, inf) maps to (0, inf)
+                    bounds_lower.append(-np.inf)
+                    bounds_upper.append(np.inf)
+                    
+                    # Use new EXP mapping
+                    param_mapping.append(('exp', [start_P + j]))
+        
         elif comp['type'] == 'DIM_1':
             vals = comp['initial_values']
-            fixed = comp['fixed']
+            fixed = comp['fixed'] # Boolean array
+            n = len(vals)
             mono = comp['monotonicity']
             
             if mode == 'transform':
@@ -715,6 +869,17 @@ def pack_parameters(components, mode='transform'):
             map_modes.append(mode_val)
             
             direct_ptr.append(len(direct_indices))
+            
+        elif m_type == 'exp':
+            map_types.append(4) # MAP_TYPE_EXP
+            map_starts_P.append(0)
+            map_counts.append(0)
+            map_cols.append(0)
+            map_modes.append(0)
+            
+            indices = mapping[1]
+            direct_indices.extend(indices)
+            direct_ptr.append(len(direct_indices))
 
     # Convert to numpy arrays for Numba
     n_map_types = np.array(map_types, dtype=np.int32)
@@ -796,6 +961,14 @@ def reconstruct_P(x, param_mapping, base_P):
                 Z = Z[::-1, ::-1]
                 
             P[start_P : start_P + rows*cols] = Z.flatten()
+            
+            P[start_P : start_P + rows*cols] = Z.flatten()
+            
+        elif m_type == 'exp':
+            indices = mapping[1]
+            for idx in indices:
+                P[idx] = np.exp(x[idx_ptr])
+                idx_ptr += 1
             
     return P
 
@@ -881,6 +1054,14 @@ def reconstruct_P_and_J(x, param_mapping, base_P):
             
             idx_ptr += count
             
+        elif m_type == 'exp':
+            indices = mapping[1]
+            for idx in indices:
+                val = np.exp(x[idx_ptr])
+                P[idx] = val
+                J[idx, idx_ptr] = val
+                idx_ptr += 1
+            
         elif m_type == 'mono_2d':
             start_P, rows, cols, mode = mapping[1], mapping[2], mapping[3], mapping[4]
             
@@ -937,6 +1118,32 @@ def reconstruct_P_and_J(x, param_mapping, base_P):
             idx_ptr += total_local
             
     return P, J
+
+def get_model_predictions(P, components, A):
+    """
+    Computes y_pred = exp(y_log) with DIM_0_LN correction.
+    """
+    y_log = A @ P
+    
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+        
+    if dim0_ln_indices:
+        for start_idx, count in dim0_ln_indices:
+            term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+            epsilon = 1e-8
+            term_log = np.log(np.maximum(term_linear, epsilon))
+            y_log += (term_log - term_linear)
+            
+    # Clamp for stability
+    y_log = np.where(y_log > 100, 100, y_log)
+    return np.exp(y_log)
 
 @numba.jit(nopython=True)
 def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols, map_modes, direct_indices, direct_ptr):
@@ -1024,6 +1231,15 @@ def reconstruct_P_numba(x, base_P, map_types, map_starts_P, map_counts, map_cols
                 for c in range(cols):
                     P[start_P + k] = Z[r, c]
                     k += 1
+                    
+        elif m_type == 4: # EXP (Log-Space)
+            start_idx = direct_ptr[i]
+            end_idx = direct_ptr[i+1]
+            for k in range(start_idx, end_idx):
+                idx = direct_indices[k]
+                val = np.exp(x[idx_ptr])
+                P[idx] = val
+                idx_ptr += 1
                     
     return P
 
@@ -1185,6 +1401,17 @@ def reconstruct_P_and_J_numba(x, base_P, map_types, map_starts_P, map_counts, ma
             
             idx_ptr += total_local
             
+        elif m_type == 4: # EXP (Log-Space)
+            start_idx = direct_ptr[i]
+            end_idx = direct_ptr[i+1]
+            for k in range(start_idx, end_idx):
+                idx = direct_indices[k]
+                val = np.exp(x[idx_ptr])
+                P[idx] = val
+                # Jacobian: dP/dx = exp(x) = P
+                J[idx, idx_ptr] = val
+                idx_ptr += 1
+            
     return P, J
 
 def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
@@ -1231,39 +1458,124 @@ def get_parameter_jacobian_matrix(x, components, param_mapping, base_P):
                 
             idx_ptr += count
             
+        elif m_type == 'exp':
+             indices = mapping[1]
+             count = len(indices)
+             
+             # P[idx] = exp(x[idx_ptr])
+             # dP/dx = exp(x[idx_ptr]) = P[idx]
+             
+             # We need P values at current x to compute this Jacobian.
+             # This means M is x-dependent.
+             # For this function, we'll compute P first, then use it.
+             # But actually, exp(x[ptr]) is just P[idx] IF P was reconstructed.
+             # Since we don't have P here, we just compute exp(x[ptr]).
+             for idx in indices:
+                 val = np.exp(x[idx_ptr])
+                 M[idx, idx_ptr] = val
+                 idx_ptr += 1
+             # This is a bit of a hack for LIL matrix, but it works.
+             
+             # Reconstruct P for this block
+             # This is inefficient, but get_parameter_jacobian_matrix is not numba-optimized
+             # and is called by jacobian_func_fast which already has P.
+             # The Numba version reconstruct_P_and_J_numba is preferred for performance.
+             
+             # For now, let's assume P is available or recompute locally.
+             # A more robust solution would be to pass P to this function.
+             # Given the current structure, we'll recompute the relevant P values.
+             
+             # This function is called by jacobian_func_fast, which already computes P.
+             # However, this function's signature doesn't include P.
+             # The instruction snippet implies a different way of building M.
+             # Let's stick to the existing LIL matrix approach and compute P values needed.
+             
+             # This is a simplified approach for the LIL matrix, assuming P values are
+             # what they would be if only this block was active.
+             # A more correct way would be to pass the full P to this function.
+             
+             # For now, we'll compute the P values for this block based on x.
+             for i_local in range(count):
+                 p_idx = indices[i_local]
+                 x_val = x[idx_ptr + i_local]
+                 M[p_idx, idx_ptr + i_local] = np.exp(x_val) # dP/dx = P
+             
+             idx_ptr += count
+            
         elif m_type == 'mono_2d':
             start_P, rows, cols, mode = mapping[1], mapping[2], mapping[3], mapping[4]
-            n_params = rows * cols
+            n_params_2d = 1 + (rows - 1) + (cols - 1) + (rows - 1) * (cols - 1)
             
             z00 = x[idx_ptr]
-            d_u = x[idx_ptr + 1 : idx_ptr + rows]
-            d_v = x[idx_ptr + rows : idx_ptr + rows + cols - 1]
-            d_int = x[idx_ptr + rows + cols - 1 : idx_ptr + n_params]
+            d_u = x[idx_ptr + 1 : idx_ptr + 1 + (rows - 1)]
+            d_v = x[idx_ptr + 1 + (rows - 1) : idx_ptr + 1 + (rows - 1) + (cols - 1)]
+            d_int = x[idx_ptr + 1 + (rows - 1) + (cols - 1) : idx_ptr + n_params_2d]
             
             _, Jac_local = compute_2d_jacobian_numba(z00, d_u, d_v, d_int, rows, cols)
             
-            Jac_reshaped = Jac_local.reshape(rows, cols, n_params)
-            
-            if mode == '1/-1':
-                Jac_reshaped = Jac_reshaped[:, ::-1, :]
-            elif mode == '-1/1':
-                Jac_reshaped = Jac_reshaped[::-1, :, :]
-            elif mode == '-1/-1':
-                Jac_reshaped = Jac_reshaped[::-1, ::-1, :]
-                
-            Jac_final = Jac_reshaped.reshape(n_params, n_params)
+            # Jac_local is (rows*cols, n_params_2d)
+            # We need to apply mode flips to Jac_local rows
+            if mode == '1/-1': # Flip V
+                perm = np.empty(rows*cols, dtype=np.int32)
+                for r in range(rows):
+                    for c in range(cols):
+                        curr_idx = r * cols + c
+                        orig_idx = r * cols + (cols - 1 - c)
+                        perm[curr_idx] = orig_idx
+                Jac_new = np.zeros_like(Jac_local)
+                for k in range(rows*cols):
+                    Jac_new[k, :] = Jac_local[perm[k], :]
+                Jac_local = Jac_new
+            elif mode == '-1/1': # Flip U
+                perm = np.empty(rows*cols, dtype=np.int32)
+                for r in range(rows):
+                    for c in range(cols):
+                        curr_idx = r * cols + c
+                        orig_idx = (rows - 1 - r) * cols + c
+                        perm[curr_idx] = orig_idx
+                Jac_new = np.zeros_like(Jac_local)
+                for k in range(rows*cols):
+                    Jac_new[k, :] = Jac_local[perm[k], :]
+                Jac_local = Jac_new
+            elif mode == '-1/-1': # Flip Both
+                perm = np.empty(rows*cols, dtype=np.int32)
+                for r in range(rows):
+                    for c in range(cols):
+                        curr_idx = r * cols + c
+                        orig_idx = (rows - 1 - r) * cols + (cols - 1 - c)
+                        perm[curr_idx] = orig_idx
+                Jac_new = np.zeros_like(Jac_local)
+                for k in range(rows*cols):
+                    Jac_new[k, :] = Jac_local[perm[k], :]
+                Jac_local = Jac_new
             
             # Assign to M (LIL is fast for this)
-            M[start_P : start_P + n_params, idx_ptr : idx_ptr + n_params] = Jac_final
+            # M[start_P : start_P + rows*cols, idx_ptr : idx_ptr + n_params_2d] = Jac_local
+            # Direct assignment for LIL
+            for r_local in range(rows*cols):
+                for c_local in range(n_params_2d):
+                    M[start_P + r_local, idx_ptr + c_local] = Jac_local[r_local, c_local]
             
-            idx_ptr += n_params
+            idx_ptr += n_params_2d
             
     return M.tocsr()
 
-def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+def residual_func_fast(x, A, param_mapping, base_P, y_true, w, dim0_ln_indices, alpha=0.0, l1_ratio=0.0):
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
     
+    # Apply log-sum correction for DIM_0_LN
+    if len(dim0_ln_indices) > 0:
+        for start_idx, count in dim0_ln_indices:
+            # P indices are contiguous for key-grouped params
+            term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+            
+            epsilon = 1e-8
+            term_log = np.log(np.maximum(term_linear, epsilon))
+            
+            # Replace linear term with log term
+            y_log += (term_log - term_linear)
+            
     # Numexpr expression
     # Updated: res = w * (y_true - exp(y_log))
     res_data = ne.evaluate('w * (y_true - exp(y_log))')
@@ -1283,10 +1595,25 @@ def residual_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
             
     return res_data
 
-def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_ratio=0.0):
+def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, dim0_ln_indices, alpha=0.0, l1_ratio=0.0):
     # 1. Reconstruct P and compute y_pred (needed for scaling)
     P = reconstruct_P(x, param_mapping, base_P)
     y_log = A @ P
+    
+    dim0_ln_terms = []
+    
+    if len(dim0_ln_indices) > 0:
+        for start_idx, count in dim0_ln_indices:
+            term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+            
+            epsilon = 1e-8
+            term_val = np.maximum(term_linear, epsilon)
+            
+            # Store term_val for Jacobian scaling
+            dim0_ln_terms.append((start_idx, count, term_val))
+            
+            term_log = np.log(term_val)
+            y_log += (term_log - term_linear)
     
     y_pred = ne.evaluate('exp(y_log)')
     
@@ -1307,28 +1634,53 @@ def jacobian_func_fast(x, A, param_mapping, base_P, y_true, w, alpha=0.0, l1_rat
     # 4. Compute J = diag(scale) @ (A @ M)
     J_unscaled = A @ M_dense
     
+    # Correction for DIM_0_LN
+    # grad_P_j needs to be scaled by (1/term_linear).
+    if len(dim0_ln_terms) > 0:
+        for start_idx, count, term_val in dim0_ln_terms:
+            inv_term = 1.0 / term_val
+            
+            # We need to find which X are mapped to these P indices.
+            # M_dense[p_idx, x_idx] = 1.
+            # Iterate P rows in this block to find X cols.
+            for p_idx in range(start_idx, start_idx + count):
+                non_zeros = np.nonzero(M_dense[p_idx, :])[0]
+                if len(non_zeros) > 0:
+                    x_idx = non_zeros[0] # Should be unique x for direct mapping (and exp mapping)
+                    # Scale column J[:, x_idx] by inv_term
+                    J_unscaled[:, x_idx] *= inv_term
+    
     # Scale rows efficiently using broadcasting (J is dense now)
     # J = J_unscaled * scale[:, None]
     J = J_unscaled * scale[:, np.newaxis]
     
-    # 5. Regularization Jacobian
     if alpha > 0:
-        # L2: term is sqrt(lambda)*x. Jacobian is sqrt(lambda)*I.
-        l2_strength = alpha * (1.0 - l1_ratio)
-        if l2_strength > 0:
-            sqrt_l2 = np.sqrt(l2_strength)
-            n_x = len(x)
-            J_l2 = np.eye(n_x) * sqrt_l2
-            J = np.vstack([J, J_l2])
-            
-        # L1: term is sqrt(lambda*|x|). Jacobian is diagonal.
-        l1_strength = alpha * l1_ratio
-        if l1_strength > 0:
-            epsilon = 1e-8
-            val = ne.evaluate('0.5 * sqrt(l1_strength / (abs(x) + epsilon)) * where(x >= 0, 1, -1)')
-            J_l1 = np.diag(val)
-            J = np.vstack([J, J_l1])
-            
+         # Regularization Jacobian
+         l2_strength = alpha * (1.0 - l1_ratio)
+         l1_strength = alpha * l1_ratio
+         
+         n_params = len(x)
+         reg_rows = []
+         
+         if l2_strength > 0:
+             # derivative of sqrt(l2)*x is sqrt(l2)
+             # Diagonal matrix of size n_params
+             J_l2 = np.identity(n_params) * np.sqrt(l2_strength)
+             reg_rows.append(J_l2)
+             
+         if l1_strength > 0:
+             # derivative of sqrt(l1*|x|) is 0.5 * sqrt(l1/|x|) * sign(x)
+             # approx: 0.5 * sqrt(l1) * sign(x) / sqrt(|x|+eps)
+             epsilon = 1e-8
+             diag_vals = 0.5 * np.sqrt(l1_strength) * np.sign(x) / np.sqrt(np.abs(x) + epsilon)
+             J_l1 = np.diag(diag_vals)
+             
+             reg_rows.append(J_l1)
+             
+         if reg_rows:
+             J_reg = np.concatenate(reg_rows, axis=0)
+             J = np.concatenate([J, J_reg], axis=0)
+             
     return J
 
 # --- 5. Output ---
@@ -1343,32 +1695,69 @@ def print_fitted_parameters(P, components):
         curr_idx += n
         
         if comp['type'] == 'DIM_0':
+            name = comp['name'] + (" (Fixed)" if comp.get('fixed') else "")
             rows.append({
-                'Parameter': comp['name'],
+                'Parameter': name,
                 'X1_Knot': '-',
                 'X2_Knot': '-',
+                'Initial_Value': comp.get('initial_value', 0.0),
                 'Fitted_Value': vals[0]
             })
             
-        elif comp['type'] == 'DIM_1':
-            for k, v in zip(comp['knots'], vals):
+        elif comp['type'] == 'DIM_0_LN':
+            sub_comps = comp['sub_components']
+            for j, sub in enumerate(sub_comps):
+                name = sub['name'] + (" (Fixed)" if sub.get('fixed') else "")
                 rows.append({
-                    'Parameter': comp['name'],
+                    'Parameter': name,
+                    'X1_Knot': '-',
+                    'X2_Knot': '-',
+                    'Initial_Value': sub.get('initial_value', 0.0),
+                    'Fitted_Value': vals[j]
+                })
+            
+        elif comp['type'] == 'DIM_1':
+            # Handle case where initial_values might be missing or shape mismatch (safeguard)
+            inits = comp.get('initial_values', np.zeros(n))
+            if len(inits) != n: inits = np.zeros(n)
+            fixed_arr = comp.get('fixed', np.zeros(n, dtype=bool))
+            
+            for i_k, (k, v, init_v) in enumerate(zip(comp['knots'], vals, inits)):
+                is_fixed = fixed_arr[i_k] if i_k < len(fixed_arr) else False
+                name = comp['name'] + (" (Fixed)" if is_fixed else "")
+                rows.append({
+                    'Parameter': name,
                     'X1_Knot': k,
                     'X2_Knot': '-',
+                    'Initial_Value': init_v,
                     'Fitted_Value': v
                 })
                 
         elif comp['type'] == 'DIM_2':
             grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            inits = comp.get('initial_values', np.zeros((comp['n_rows'], comp['n_cols'])))
+            fixed_grid = comp.get('fixed', np.zeros((comp['n_rows'], comp['n_cols']), dtype=bool))
+            
             for r in range(comp['n_rows']):
                 for c in range(comp['n_cols']):
+                    is_fixed = fixed_grid[r, c]
+                    name = comp['name'] + (" (Fixed)" if is_fixed else "")
                     rows.append({
-                        'Parameter': comp['name'],
+                        'Parameter': name,
                         'X1_Knot': comp['knots_x1'][r],
                         'X2_Knot': comp['knots_x2'][c],
+                        'Initial_Value': inits[r, c],
                         'Fitted_Value': grid[r, c]
                     })
+        elif comp['type'] == 'EXP':
+            for j, sub in enumerate(comp['sub_components']):
+                rows.append({
+                    'Parameter': sub['name'],
+                    'X1_Knot': '-',
+                    'X2_Knot': '-',
+                    'Initial_Value': sub.get('initial_value', 0.0),
+                    'Fitted_Value': vals[j]
+                })
     
     df_results = pd.DataFrame(rows)
     pd.options.display.float_format = '{:.4f}'.format
@@ -1376,8 +1765,7 @@ def print_fitted_parameters(P, components):
 
 def plot_fitting_results(P, components, data, y_true, true_values):
     A = precompute_basis(components, data)
-    y_log = A @ P
-    y_pred = np.exp(y_log)
+    y_pred = get_model_predictions(P, components, A)
     
     plt.figure(figsize=(10, 6))
     plt.scatter(y_true, y_pred, alpha=0.3, s=10)
@@ -1398,11 +1786,35 @@ def plot_fitting_results(P, components, data, y_true, true_values):
         
         if comp['type'] == 'DIM_1':
             plt.figure(figsize=(8, 5))
-            plt.plot(comp['knots'], vals, 'ro-', label='Fitted')
-            plt.plot(comp['knots'], t_vals, 'g--', label='True')
             
-            x_grid = np.linspace(comp['knots'].min(), comp['knots'].max(), 100)
-            y_grid = np.interp(x_grid, comp['knots'], vals)
+            # Robust length check
+            n_k = len(comp['knots'])
+            n_v = len(vals)
+            if n_k != n_v:
+                print(f"Warning: DIM_1_MPL '{comp['name']}' shape mismatch. Knots: {n_k}, Params: {n_v}. Slicing to min.")
+                min_len = min(n_k, n_v)
+                k_use = comp['knots'][:min_len]
+                v_use = vals[:min_len]
+            else:
+                k_use = comp['knots']
+                v_use = vals
+
+            plt.plot(k_use, v_use, 'ro-', label='Fitted')
+            
+            if t_vals is not None:
+                # Robustly handle t_vals vs k_use mismatch
+                min_len_t = min(len(k_use), len(t_vals))
+                if min_len_t < len(k_use) or min_len_t < len(t_vals):
+                     t_plot = t_vals[:min_len_t]
+                     k_plot_t = k_use[:min_len_t]
+                else:
+                     t_plot = t_vals
+                     k_plot_t = k_use
+
+                plt.plot(k_plot_t, t_plot, 'g--', label='True')
+            
+            x_grid = np.linspace(k_use.min(), k_use.max(), 100)
+            y_grid = np.interp(x_grid, k_use, v_use)
             plt.plot(x_grid, y_grid, 'b-', alpha=0.3)
             
             plt.title(f"{comp['name']}")
@@ -1619,8 +2031,17 @@ def build_constraints(components, param_mapping, x0_len):
     C = scipy.sparse.csr_matrix((vals, (rows, cols)), shape=(len(lb), x0_len))
     return scipy.optimize.LinearConstraint(C, lb, ub)
 
-def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, method='trust-constr', options=None, stop_event=None):
+def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, bounds, param_mapping_numba, method='trust-constr', options=None, stop_event=None):
     print(f"Running Scipy Minimize ({method})...")
+    
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
     
     # Build constraints
     constraints = []
@@ -1646,7 +2067,17 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
             
         P = reconstruct_P(x, param_mapping, base_P)
         y_log = A @ P
+        
+        # Apply DIM_0_LN correction
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_log = np.log(np.maximum(term_linear, epsilon))
+                y_log += (term_log - term_linear)
+        
         y_pred = np.exp(y_log)
+
         # res = w * (y - y_pred)
         res = w * (y_true - y_pred)
         val = 0.5 * np.sum(res**2)
@@ -1666,6 +2097,19 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
         # Gradient of objective
         P = reconstruct_P(x, param_mapping, base_P)
         y_log = A @ P
+        
+        dim0_ln_terms = []
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_val = np.maximum(term_linear, epsilon)
+                dim0_ln_terms.append((start_idx, count, term_val))
+                
+                term_log = np.log(term_val)
+                y_log += (term_log - term_linear)
+
+        y_pred = np.exp(y_log)
         y_pred = np.exp(y_log)
         # res = w * (y - y_pred)
         res = w * (y_true - y_pred)
@@ -1684,6 +2128,20 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
         # Construct full gradient wrt P
         grad_P = A.T @ term
         
+        # Apply correction to grad_P for DIM_0_LN components
+        for start_idx, count, term_val in dim0_ln_terms:
+            inv_term_linear = 1.0 / term_val
+            term_mod = term * inv_term_linear
+            grad_new = A[:, start_idx : start_idx + count].T @ term_mod
+            grad_P[start_idx : start_idx + count] = grad_new
+        
+        # Apply correction to grad_P for DIM_0_LN components
+        for start_idx, count, term_val in dim0_ln_terms:
+            inv_term_linear = 1.0 / term_val
+            term_mod = term * inv_term_linear
+            grad_new = A[:, start_idx : start_idx + count].T @ term_mod
+            grad_P[start_idx : start_idx + count] = grad_new
+        
         # Map back to x
         grad_x = np.zeros_like(x)
         idx_ptr = 0
@@ -1692,6 +2150,14 @@ def fit_scipy_minimize(x0, A, param_mapping, base_P, y_true, w, components, meth
                 indices = mapping[1]
                 for idx in indices:
                     grad_x[idx_ptr] = grad_P[idx]
+                    idx_ptr += 1
+            elif mapping[0] == 'exp':
+                indices = mapping[1]
+                for idx in indices:
+                    # For EXP, P[idx] = exp(x[idx_ptr])
+                    # dP[idx]/dx[idx_ptr] = P[idx]
+                    # grad_x[idx_ptr] = grad_P[idx] * dP[idx]/dx[idx_ptr]
+                    grad_x[idx_ptr] = grad_P[idx] * P[idx]
                     idx_ptr += 1
                     
         # Add Regularization Gradient
@@ -1818,11 +2284,6 @@ def fit_linearized_ls(x0, A, param_mapping, base_P, y_true, w, components, bound
     y_pred = np.exp(A @ P_final)
     # Correct residual for reporting/metrics (often we want just raw error, but metrics might use it)
     # The user asked to update residual function from (y-y_pred)/w to (y-y_pred)*w
-    # But usually 'residuals' variable appearing here is generic.
-    # Let's check usage. 
-    # If this is for `calculate_metrics(y_true, y_pred, w, n_params)` below?
-    # No, it's just saved in `res` dict.
-    # Let's keep it consistent with the backend definition if possible, OR keep it physical (y-yp).
     # But code uses `residuals` variable name often for "weighted residuals" in optimization context.
     # However at the end of fit, usually we want physical residuals.
     # Let's stick to the requested definition for optimization logic, 
@@ -1846,11 +2307,25 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
     
     # Unpack Numba mapping arrays
     (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
-    
-    # Extract options
-    options = options or {}
-    l1_reg = options.get('l1_reg', 0.0)
-    l2_reg = options.get('l2_reg', 0.0)
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+
+    # Normalize weights for numerical stability of L-BFGS-B
+    w_mean = np.mean(w)
+    if w_mean > 0:
+        w_norm = w / w_mean
+        l1_reg = options.get('l1_reg', 0.0) / w_mean
+        l2_reg = options.get('l2_reg', 0.0) / w_mean
+    else:
+        w_norm = w
+        l1_reg = options.get('l1_reg', 0.0)
+        l2_reg = options.get('l2_reg', 0.0)
     
     def objective(x):
         if stop_event and stop_event.is_set():
@@ -1859,23 +2334,32 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
         # 1. Reconstruct P
         P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
         
-        # 2. Compute Loss
+        # 2. Compute Gradient
         y_log = A @ P
         
+        # Apply DIM_0_LN correction
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_log = np.log(np.maximum(term_linear, epsilon))
+                y_log += (term_log - term_linear)
+
         # Clamp for stability
         y_log = np.where(y_log > 100, 100, y_log)
         
         y_pred = np.exp(y_log)
         
-        # Loss = sum(w * (y_pred - y_true * y_log))
-        # Poisson loss (negative log likelihood up to constant)
-        loss = np.sum(w * (y_pred - y_true * y_log))
+        # Poisson loss with normalized weights
+        loss = np.sum(w_norm * (y_pred - y_true * y_log))
         
-        # Add Regularization
+        # Add Regularization (scaled)
         if l2_reg > 0:
             loss += 0.5 * l2_reg * np.sum(x**2)
         if l1_reg > 0:
             loss += l1_reg * np.sum(np.abs(x))
+            
+        return loss
             
         return loss
         
@@ -1888,15 +2372,46 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
         
         # 2. Compute Gradient
         y_log = A @ P
+        
+        # Apply DIM_0_LN correction and save terms for gradient
+        dim0_ln_terms = []
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_val = np.maximum(term_linear, epsilon)
+                dim0_ln_terms.append((start_idx, count, term_val))
+                
+                term_log = np.log(term_val)
+                y_log += (term_log - term_linear)
+        
         y_log = np.where(y_log > 100, 100, y_log)
         y_pred = np.exp(y_log)
         
         # dLoss/d(y_log) = w * (y_pred - y_true)
-        term = w * (y_pred - y_true)
+        term = w_norm * (y_pred - y_true)
         
         # grad_P = A.T @ term
         grad_P = A.T @ term
         
+        # Apply correction to grad_P for DIM_0_LN components
+        for start_idx, count, term_val in dim0_ln_terms:
+            # Recompute gradient for this block of parameters
+            inv_term_linear = 1.0 / term_val
+            term_mod = term * inv_term_linear
+            
+            # Sub-matrix of A
+            A_sub = A[:, start_idx : start_idx + count]
+            
+            # Calculate what was added: A_sub.T @ term
+            # grad_old = A_sub.T @ term
+            
+            # Calculate what should be added: A_sub.T @ term_mod
+            grad_new = A_sub.T @ term_mod
+            
+            # Update
+            grad_P[start_idx : start_idx + count] = grad_new
+
         # grad_x = M.T @ grad_P
         grad_x = M.T @ grad_P
         
@@ -1905,28 +2420,48 @@ def fit_poisson_lbfgsb(x0, A, param_mapping, base_P, y_true, w, components, boun
             grad_x += l2_reg * x
         if l1_reg > 0:
             grad_x += l1_reg * np.sign(x)
-        
+            
         return grad_x
 
     run_options = {'maxiter': 1000, 'ftol': 1e-6}
     if options:
-        # Filter for L-BFGS-B
         valid_keys = ['maxiter', 'ftol', 'gtol', 'eps', 'disp', 'maxcor', 'maxls']
         filtered = {k: v for k, v in options.items() if k in valid_keys}
         run_options.update(filtered)
 
-    res = scipy.optimize.minimize(
-        objective,
-        x0,
-        jac=jacobian,
-        method='L-BFGS-B',
-        bounds=bnds,
-        options=run_options
-    )
+    global_opt = options.get('global_opt', None) if options else None
+    
+    if global_opt == 'basinhopping':
+        print("Running Poisson Loss (Global: basinhopping)...")
+        minimizer_kwargs = {
+            "method": "L-BFGS-B",
+            "jac": jacobian,
+            "bounds": bnds,
+            "options": run_options
+        }
+        res = scipy.optimize.basinhopping(
+            objective,
+            x0,
+            minimizer_kwargs=minimizer_kwargs,
+            niter=options.get('n_iter', 10) if options else 10,
+            disp=True
+        )
+        # Basinhopping result optimization
+        if not hasattr(res, 'success'): res.success = True
+        
+    else:
+        res = scipy.optimize.minimize(
+            objective,
+            x0,
+            jac=jacobian,
+            method='L-BFGS-B',
+            bounds=bnds,
+            options=run_options
+        )
     
     # Calculate Least Squares Cost for consistency
     P_final = reconstruct_P_numba(res.x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
-    y_pred_final = np.exp(A @ P_final)
+    y_pred_final = get_model_predictions(P_final, components, A)
     residuals = (y_true - y_pred_final) * w
     res.cost = 0.5 * np.sum(residuals**2)
     
@@ -1942,6 +2477,15 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
     # Unpack Numba mapping arrays
     (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
     
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+
     # Extract options
     options = options or {}
     l1_reg = options.get('l1_reg', 0.0)
@@ -1972,6 +2516,19 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
             P, M = reconstruct_P_and_J_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
             
             y_log = A @ P
+            
+            # Apply DIM_0_LN correction and save terms for gradient
+            dim0_ln_terms = []
+            if len(dim0_ln_indices) > 0:
+                for start_idx, count in dim0_ln_indices:
+                    term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                    epsilon = 1e-8
+                    term_val = np.maximum(term_linear, epsilon)
+                    dim0_ln_terms.append((start_idx, count, term_val))
+                    
+                    term_log = np.log(term_val)
+                    y_log += (term_log - term_linear)
+
             # Clamp y_log to avoid overflow and extreme values
             # exp(100) is ~2e43, which is plenty large for regression but safe for squaring
             y_pred = ne.evaluate("exp(where(y_log > 100, 100, y_log))")
@@ -1994,6 +2551,15 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
             term = ne.evaluate("- (w * res * y_pred)", local_dict={'res': res, 'y_pred': y_pred, 'w': w})
             
             grad_P = A.T @ term
+            
+            # Apply correction to grad_P for DIM_0_LN components
+            for start_idx, count, term_val in dim0_ln_terms:
+                inv_term_linear = 1.0 / term_val
+                term_mod = term * inv_term_linear
+                A_sub = A[:, start_idx : start_idx + count]
+                grad_new = A_sub.T @ term_mod
+                grad_P[start_idx : start_idx + count] = grad_new
+
             grad_x = M.T @ grad_P
             
             # Add Regularization Gradient
@@ -2010,6 +2576,15 @@ def fit_nlopt(x0, A, param_mapping, base_P, y_true, w, components, bounds, param
             # Value only
             P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
             y_log = A @ P
+            
+            # Apply DIM_0_LN correction
+            if len(dim0_ln_indices) > 0:
+                for start_idx, count in dim0_ln_indices:
+                    term_linear = A[:, start_idx : start_idx + count] @ P[start_idx : start_idx + count]
+                    epsilon = 1e-8
+                    term_log = np.log(np.maximum(term_linear, epsilon))
+                    y_log += (term_log - term_linear)
+
             y_pred = ne.evaluate("exp(where(y_log > 100, 100, y_log))")
             res = ne.evaluate("(y_true - y_pred) * w", local_dict={'y_true': y_true, 'y_pred': y_pred, 'w': w})
             val = 0.5 * ne.evaluate("sum(res**2)", local_dict={'res': res})
@@ -2045,6 +2620,15 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
     # Unpack Numba mapping arrays
     (n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr) = param_mapping_numba
     
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+
     # Extract options
     options = options or {}
     l1_reg = options.get('l1_reg', 0.0)
@@ -2069,6 +2653,14 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         # 3. Compute Loss on GPU
         y_log_gpu = A_gpu @ P_gpu
         
+        # Apply DIM_0_LN correction
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear_gpu = A_gpu[:, start_idx : start_idx + count] @ P_gpu[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_log_gpu = cp.log(cp.maximum(term_linear_gpu, epsilon))
+                y_log_gpu += (term_log_gpu - term_linear_gpu)
+
         # Clamp for stability
         y_log_gpu = cp.where(y_log_gpu > 100, 100, y_log_gpu)
         
@@ -2100,6 +2692,19 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         
         # 3. Compute Gradient on GPU
         y_log_gpu = A_gpu @ P_gpu
+        
+        # Apply DIM_0_LN correction and save terms for gradient
+        dim0_ln_terms = []
+        if len(dim0_ln_indices) > 0:
+            for start_idx, count in dim0_ln_indices:
+                term_linear_gpu = A_gpu[:, start_idx : start_idx + count] @ P_gpu[start_idx : start_idx + count]
+                epsilon = 1e-8
+                term_val_gpu = cp.maximum(term_linear_gpu, epsilon)
+                dim0_ln_terms.append((start_idx, count, term_val_gpu)) # Store GPU array
+                
+                term_log_gpu = cp.log(term_val_gpu)
+                y_log_gpu += (term_log_gpu - term_linear_gpu)
+
         y_log_gpu = cp.where(y_log_gpu > 100, 100, y_log_gpu)
         y_pred_gpu = cp.exp(y_log_gpu)
         
@@ -2109,6 +2714,14 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
         # grad_P = A.T @ term
         grad_P_gpu = A_gpu.T @ term_gpu
         
+        # Apply correction to grad_P for DIM_0_LN components
+        for start_idx, count, term_val_gpu in dim0_ln_terms:
+            inv_term_linear_gpu = 1.0 / term_val_gpu
+            term_mod_gpu = term_gpu * inv_term_linear_gpu
+            A_sub_gpu = A_gpu[:, start_idx : start_idx + count]
+            grad_new_gpu = A_sub_gpu.T @ term_mod_gpu
+            grad_P_gpu[start_idx : start_idx + count] = grad_new_gpu
+
         # 4. Transfer grad_P back to CPU
         grad_P = cp.asnumpy(grad_P_gpu)
         
@@ -2154,6 +2767,33 @@ def fit_poisson_cupy(x0, A, param_mapping, base_P, y_true, w, components, bounds
     
     return res
 
+def fit_scipy_ls(x0, A, param_mapping, base_P, y_true, w, components, bounds, param_mapping_numba, method='trf', options=None, **kwargs):
+    print(f"Running Scipy Least Squares (Trust Region Reflective)...")
+    
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+
+    alpha = options.get('alpha', 0.0) if options else 0.0
+    l1_ratio = options.get('l1_ratio', 0.0) if options else 0.0
+    res = scipy.optimize.least_squares(
+        residual_func_fast, 
+        x0, 
+        jac=jacobian_func_fast,
+        bounds=bounds,
+        args=(A, param_mapping, base_P, y_true, w, dim0_ln_indices, alpha, l1_ratio),
+        verbose=2,
+        method=method,
+        x_scale='jac',
+        **kwargs
+    )
+    return res
+
 def run_fitting(backend='scipy_ls', method='trf'):
     global components
     check_numba_status()
@@ -2174,7 +2814,7 @@ def run_fitting(backend='scipy_ls', method='trf'):
     
     # Determine packing mode
     pack_mode = 'transform'
-    if backend in ['scipy_min', 'nlopt', 'cupy']:
+    if backend in ['scipy_min', 'nlopt', 'cupy', 'poisson_lbfgsb', 'poisson_cupy']: # Added poisson backends
         pack_mode = 'direct'
         
     x0, bounds, param_mapping, base_P = pack_parameters(components, mode=pack_mode)
@@ -2189,24 +2829,13 @@ def run_fitting(backend='scipy_ls', method='trf'):
     res = None
     
     if backend == 'scipy_ls':
-        alpha = 0.0
-        l1_ratio = 0.5
-        res = scipy.optimize.least_squares(
-            residual_func_fast,
-            x0,
-            jac=jacobian_func_fast,
-            bounds=bounds,
-            args=(A, param_mapping, base_P, y_true_arr, w_arr, alpha, l1_ratio),
-            verbose=2,
-            method=method,
-            x_scale='jac'
-        )
+        res = fit_scipy_ls(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, method=method)
         
     elif backend == 'scipy_min':
         res = fit_scipy_minimize(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, method=method)
         
     elif backend == 'nlopt':
-        res = fit_nlopt(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, method=method)
+        res = fit_nlopt(x0, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, method=method)
         
     elif backend == 'cupy':
         res = fit_cupy(x0, A, param_mapping, base_P, y_true_arr, w_arr, components)
@@ -2222,8 +2851,7 @@ def run_fitting(backend='scipy_ls', method='trf'):
         
         # Benchmarks
         # Re-calculate predictions
-        y_log_final = A @ P_final
-        y_pred_final = np.exp(y_log_final)
+        y_pred_final = get_model_predictions(P_final, components, A)
         gini = calculate_gini(y_true_arr, y_pred_final, w_arr)
         print(f"Gini Coefficient: {gini:.4f}")
         
@@ -2248,8 +2876,7 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
     # If y_pred is not provided, compute it (fallback)
     if y_pred is None:
         A = precompute_basis(components, data)
-        y_log = A @ P
-        y_pred = np.exp(y_log)
+        y_pred = get_model_predictions(P, components, A)
         
     if residuals is None:
         residuals = y_true - y_pred
@@ -2341,13 +2968,37 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             ax = fig_comp.add_subplot(111)
             
             # Recalculate spline for component plot
+            # Recalculate spline for component plot
             x_grid = np.linspace(plot_knots.min(), plot_knots.max(), 100)
-            y_knots_plot = np.interp(plot_knots, comp['knots'], vals)
-            y_grid = np.interp(x_grid, comp['knots'], vals)
+            
+            # Robust interp
+            n_k = len(comp['knots'])
+            n_v = len(vals)
+            if n_k != n_v:
+                print(f"Warning: DIM_1_GUI '{comp['name']}' shape mismatch. Knots: {n_k}, Params: {n_v}. Slicing to min.")
+                min_len = min(n_k, n_v)
+                k_use = comp['knots'][:min_len]
+                v_use = vals[:min_len]
+            else:
+                k_use = comp['knots']
+                v_use = vals
+                
+            y_knots_plot = np.interp(plot_knots, k_use, v_use)
+            y_grid = np.interp(x_grid, k_use, v_use)
             
             ax.plot(plot_knots, y_knots_plot, 'ro-', label='Fitted')
             if t_vals is not None:
-                ax.plot(comp['knots'], t_vals, 'g--', label='True (Fit Knots)')
+                # Robustly handle t_vals vs k_use mismatch (even if t_vals is shorter)
+                min_len_t = min(len(k_use), len(t_vals))
+                if min_len_t < len(k_use) or min_len_t < len(t_vals):
+                     # Slice BOTH to common length
+                     t_plot = t_vals[:min_len_t]
+                     k_plot_t = k_use[:min_len_t]
+                else:
+                     t_plot = t_vals
+                     k_plot_t = k_use
+                
+                ax.plot(k_plot_t, t_plot, 'g--', label='True (Fit Knots)')
             
             ax.plot(x_grid, y_grid, 'b-', alpha=0.3)
             ax.set_title(f"{comp['name']}")
@@ -2594,6 +3245,66 @@ def plot_fitting_results_gui(P, components, data, y_true, true_values, y_pred=No
             
             figures[f"Component: {comp['name']}"] = fig_hm
 
+        elif comp['type'] == 'DIM_0_LN':
+            # Bar chart for coefficients
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+            
+            sub_names = [sub['x1_var'] for sub in comp['sub_components']]
+            x = np.arange(len(sub_names))
+            width = 0.35
+            
+            # Fitted
+            ax.bar(x - width/2, vals, width, label='Fitted', color=COLORS['yellow'], alpha=0.9)
+            
+            # True
+            if t_vals is not None:
+                # Ensure dimensions match
+                if len(t_vals) == len(vals):
+                     ax.bar(x + width/2, t_vals, width, label='True', color=COLORS['darkblue'], alpha=0.7)
+                else:
+                     # Fallback if mismatch (shouldn't happen with generation fix)
+                     print(f"Comparison mismatch for {comp['name']}")
+                     
+            ax.set_xticks(x)
+            ax.set_xticklabels(sub_names, rotation=45, ha='right')
+            ax.set_ylabel('Coefficient Value')
+            ax.set_title(f"Coefficients: {comp['name']}")
+            ax.legend()
+            ax.grid(True, axis='y', alpha=0.3)
+            
+            figures[f"Component: {comp['name']}"] = fig
+        
+        elif comp['type'] == 'EXP':
+            # Bar chart for coefficients
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+            
+            sub_names = [sub['x1_var'] for sub in comp['sub_components']]
+            x = np.arange(len(sub_names))
+            width = 0.35
+            
+            # Fitted
+            ax.bar(x - width/2, vals, width, label='Fitted', color=COLORS['yellow'], alpha=0.9)
+            
+            # True
+            if t_vals is not None:
+                # Ensure dimensions match
+                if len(t_vals) == len(vals):
+                     ax.bar(x + width/2, t_vals, width, label='True', color=COLORS['darkblue'], alpha=0.7)
+                else:
+                     # Fallback if mismatch (shouldn't happen with generation fix)
+                     print(f"Comparison mismatch for {comp['name']}")
+                     
+            ax.set_xticks(x)
+            ax.set_xticklabels(sub_names, rotation=45, ha='right')
+            ax.set_ylabel('Coefficient Value')
+            ax.set_title(f"Coefficients: {comp['name']}")
+            ax.legend()
+            ax.grid(True, axis='y', alpha=0.3)
+            
+            figures[f"Component: {comp['name']}"] = fig
+
     fig = Figure(figsize=(10, 6))
     ax = fig.add_subplot(111)
     ax.scatter(y_pred_plot, res_plot, alpha=0.3, s=10)
@@ -2766,6 +3477,13 @@ def generate_scoring_code(components, P, language='sql'):
                     parts.append(f"    {cond} THEN {slope:.6f} * {var} + {intercept:.6f}")
                 parts.append("  END)")
                 terms.append("\n".join(parts))
+            elif comp['type'] == 'EXP':
+                # For EXP, P[idx] = exp(x[idx_ptr])
+                # The fitted value is P[idx], but the underlying parameter is x[idx_ptr]
+                # If we want to output the 'x' value, we need to store it.
+                # For scoring, we output the P value directly.
+                for j, sub in enumerate(comp['sub_components']):
+                    terms.append(f"  -- {sub['name']} (EXP)\n  {vals[j]:.6f}")
         code.append(" + \n".join(terms))
         code.append("AS predicted_value")
     return "\n".join(code)
@@ -2856,13 +3574,16 @@ def generate_fit_analysis(results, df_data):
             # Identify used variables
             used_vars = set()
             for c in comps:
-                if 'x1_var' in c: used_vars.add(c['x1_var'])
+                if 'x1_var' in c and c['x1_var']: used_vars.add(c['x1_var'])
                 if 'x2_var' in c and c['x2_var']: used_vars.add(c['x2_var'])
+                if 'sub_components' in c:
+                    for sub in c['sub_components']:
+                        if 'x1_var' in sub and sub['x1_var']: used_vars.add(sub['x1_var'])
             
             # Get numeric columns from df_data
             # Handle Polars vs Pandas
             all_numerics = []
-            if isinstance(df_data, pl.DataFrame):
+            if HAS_POLARS and isinstance(df_data, pl.DataFrame):
                 # Polars: Select numeric
                 all_numerics = [c for c, t in zip(df_data.columns, df_data.dtypes) if t in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
                 # Helper to get column data
@@ -2901,7 +3622,7 @@ def generate_fit_analysis(results, df_data):
              used_vars_list = sorted(list(used_vars))
              # Filter numeric (Pandas only for now or safe check)
              numeric_vars = []
-             if isinstance(df_data, pl.DataFrame):
+             if HAS_POLARS and isinstance(df_data, pl.DataFrame):
                   numeric_vars = [v for v in used_vars_list if v in df_data.columns and df_data[v].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
                   get_col = lambda c: df_data[c].to_numpy()
              else:
@@ -2958,7 +3679,7 @@ def generate_fit_analysis(results, df_data):
                     sorted_knots = np.sort(knots)
                     
                     if len(sorted_knots) > 1 and df_data is not None and comp['x1_var'] in df_data.columns:
-                        x_vals = df_data[comp['x1_var']].to_numpy() if isinstance(df_data, pl.DataFrame) else df_data[comp['x1_var']].values
+                        x_vals = df_data[comp['x1_var']].to_numpy() if (HAS_POLARS and isinstance(df_data, pl.DataFrame)) else df_data[comp['x1_var']].values
                         
                         # Histogram data
                         counts, bin_edges = np.histogram(x_vals, bins=sorted_knots)
@@ -3001,7 +3722,7 @@ def generate_fit_analysis(results, df_data):
                                  s_ks = np.sort(ks)
                                  
                                  if len(s_ks) > 1 and v_name in df_data.columns:
-                                     x_vals = df_data[v_name].to_numpy() if isinstance(df_data, pl.DataFrame) else df_data[v_name].values
+                                     x_vals = df_data[v_name].to_numpy() if (HAS_POLARS and isinstance(df_data, pl.DataFrame)) else df_data[v_name].values
                                      
                                      indices = np.searchsorted(s_ks, x_vals, side='right') - 1
                                      indices = np.clip(indices, 0, len(s_ks) - 2)
@@ -3044,6 +3765,81 @@ def generate_fit_analysis(results, df_data):
     return analysis, suggestions
 
 
+def apply_dim0_ln_anchoring(components, df_data):
+    """
+    Checks each DIM_0_LN group. If no sub-component is fixed,
+    finds the one with the maximum weighted sum (population) and fixes it to 1.0.
+    """
+    if df_data is None: return
+
+    # Prepare balance for weighting
+    # With Unconstrained Log-Space Form, we do NOT want to force any parameter to be fixed.
+    # The user explicitly requested "no constraint on beta_purpp".
+    # So we bypass auto-anchoring.
+    return
+    
+    if 'balance' in df_data.columns:
+         if hasattr(df_data, "select"): # Polars
+             w_arr = df_data['balance'].to_numpy()
+         else:
+             w_arr = df_data['balance'].values
+    elif 'w' in df_data.columns:
+         if hasattr(df_data, "select"):
+             w_arr = df_data['w'].to_numpy()
+         else:
+             w_arr = df_data['w'].values
+    else:
+        w_arr = np.ones(len(df_data))
+        
+    # Ensure positive weights
+    w_arr = np.clip(w_arr, 0, None)
+
+    # Helper for polars/pandas column extraction
+    def get_col(var):
+        if hasattr(df_data, "select"): # Polars
+             return df_data[var].to_numpy()
+        else:
+             return df_data[var].values
+
+    for comp in components:
+        if comp['type'] == 'DIM_0_LN':
+            sub_comps = comp['sub_components']
+            
+            # Check if any is already fixed
+            any_fixed = False
+            for sub in sub_comps:
+                if sub.get('fixed', False): 
+                    any_fixed = True
+                    break
+            
+            if not any_fixed:
+                # Need to anchor one. Find max population.
+                max_pop = -1.0
+                best_sub_idx = -1
+                
+                print(f"DEBUG: Anchoring checking {comp.get('key')} with {len(sub_comps)} subs.")
+
+                for i, sub in enumerate(sub_comps):
+                    var = sub['x1_var']
+                    try:
+                        x_vals = get_col(var)
+                        # Weighted sum of X (assuming X is the exposure/indicator)
+                        pop_sum = np.sum(x_vals * w_arr)
+                        
+                        if pop_sum > max_pop:
+                            max_pop = pop_sum
+                            best_sub_idx = i
+                    except Exception as e:
+                        print(f"Warning: Could not calculate population for {var}: {e}")
+                
+                if best_sub_idx != -1:
+                    target_sub = sub_comps[best_sub_idx]
+                    print(f"ℹ️ Auto-Anchoring '{target_sub['x1_var']}' (Pop={max_pop:.2e}) to 1.0 for Identifiability.")
+                    
+                    # Fix it
+                    target_sub['fixed'] = True
+                    target_sub['initial_value'] = 1.0 # Anchor to 1.0
+
 def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback=None, backend='scipy_ls', method='trf', options=None, stop_event=None, plotting_backend='matplotlib'):
     """
     API version of run_fitting for GUI.
@@ -3065,6 +3861,84 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     
     if progress_callback: progress_callback(0.5, "Constructing parameters...")
     
+    # Auto-Anchor DIM_0_LN components if needed
+    apply_dim0_ln_anchoring(components, df_data)
+    
+    # --- SMART INITIALIZATION FOR INTERCEPT ---
+    # To prevent optimizer getting stuck due to huge distance between init (0) and target (log(mean_y))
+    try:
+        if hasattr(df_data, "select"):
+             y_arr = df_data['y'].to_numpy()
+        else:
+             y_arr = df_data['y'].values
+        
+        y_mean = np.mean(y_arr)
+        if y_mean > 1e-9:
+            target_intercept = np.log(y_mean)
+        else:
+            target_intercept = -10.0
+            
+        for comp in components:
+            if comp['type'] == 'DIM_0' and ('00LVL' in comp['name'] or 'Intercept' in comp['name']):
+                current_init = comp.get('initial_value', 0.0)
+                # Only override if default 0.0 is found
+                if abs(current_init) < 1e-6:
+                     print(f"ℹ️ Auto-Initializing Intercept '{comp['name']}' to {target_intercept:.4f} (log mean).")
+                     comp['initial_value'] = target_intercept
+            
+            # SAFE INITIALIZATION FOR DIM_0_LN
+            # If coefficients are 0, sum is 0, log(sum) is -inf, gradient is inf.
+            if comp['type'] == 'DIM_0_LN':
+                # Determine target value
+                # If Intercept is effectively OFF (very small or not present), 
+                # we should initialize these coefficients to match the mean rate.
+                # y ~ sum(beta * X). So beta ~ mean(y) / mean(X).
+                
+                target_val = 1.0 # Default fallback
+                
+                # Check for active intercept
+                has_intercept = False
+                for c in components:
+                    if c['type'] == 'DIM_0' and ('00LVL' in c['name'] or 'Intercept' in c['name']):
+                        if abs(c.get('initial_value', 0.0)) > -9.0: # -10 is our "disabled/small" marker
+                            has_intercept = True
+                            break
+                
+                if not has_intercept:
+                    # Calculate target beta
+                    # This is rough but better than 1.0 if y ~ 0.01
+                    # Assuming X components are roughly order 1.
+                     if y_mean > 1e-9:
+                         target_val = y_mean
+                     else:
+                         target_val = 1e-4
+
+                # Check sub components
+                for sub in comp.get('sub_components', []):
+                     # Only auto-init if NOT fixed and close to zero
+                     if not sub.get('fixed', False) and abs(sub.get('initial_value', 0.0)) < 1e-6:
+                         print(f"ℹ️ Auto-Initializing DIM_0_LN '{sub['name']}' to {target_val:.4f} (Smart Init).")
+                         sub['initial_value'] = target_val
+            
+            # SAFE INITIALIZATION FOR EXP
+            # If coefficients are 0, exp(0)=1. If they are very negative, exp(x) is near 0.
+            # If the true value is 0, then x should be -inf.
+            # If the true value is 1, then x should be 0.
+            # If the true value is 0.5, then x should be log(0.5) = -0.69.
+            # Default initial_value for EXP is 0, which means P=1. This is usually fine.
+            # If the true value is 0, then x should be -inf.
+            # If the true value is 1, then x should be 0.
+            # If the true value is 0.5, then x should be log(0.5) = -0.69.
+            # Default initial_value for EXP is 0, which means P=1. This is usually fine.
+            if comp['type'] == 'EXP':
+                for sub in comp.get('sub_components', []):
+                    # If initial_value is not set, it defaults to 0.0.
+                    # exp(0.0) = 1.0, which is a reasonable starting point for a multiplier.
+                    # No specific auto-init needed unless we have prior knowledge.
+                    pass
+    except Exception as e:
+        print(f"Warning: Could not auto-initialize intercept: {e}")
+    
     # Determine packing mode
     pack_mode = 'transform'
     if backend in ['scipy_min', 'nlopt']:
@@ -3075,6 +3949,8 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     x0, bounds, param_mapping, base_P, param_mapping_numba = pack_parameters(components, mode=pack_mode)
     
     if progress_callback: progress_callback(0.6, f"Optimizing {len(x0)} parameters (Backend: {backend})...")
+    
+    
     start_time = time.time()
     
     # Extract numpy arrays for fitting (Polars compatibility)
@@ -3100,6 +3976,16 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     # LS Backends expect 'w' to be the residual multiplier: res = w * (y-ym). Effective stats weight is w^2.
     # Poisson Backends expect 'w' to be the stats weight: Sum w * Loss. Effective stats weight is w.
     
+    
+    # Pre-calculate DIM_0_LN indices
+    dim0_ln_indices = []
+    curr_P_idx = 0
+    for comp in components:
+        n = comp['n_params']
+        if comp['type'] == 'DIM_0_LN':
+            dim0_ln_indices.append((curr_P_idx, n))
+        curr_P_idx += n
+
     ls_backends = ['scipy_ls', 'scipy_min', 'linearized_ls', 'nlopt', 'differential_evolution', 'basinhopping']
     
     if backend in ls_backends:
@@ -3174,12 +4060,18 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
                 return jacobian_func_fast(x, *args[:-1])
 
             try:
+                # Support Finite Difference Check
+                use_fd = options.get('use_finite_difference', False)
+                jac_arg = jacobian_wrapper if not use_fd else '2-point'
+                if use_fd and i_start == 0:
+                     print("DEBUG: Using Finite Difference Jacobian (Analytic Disabled)")
+                
                 res = scipy.optimize.least_squares(
                     residual_wrapper,
                     x_current,
-                    jac=jacobian_wrapper,
+                    jac=jac_arg,
                     bounds=bounds,
-                    args=(A, param_mapping, base_P, y_true_arr, w_arr, alpha, l1_ratio, stop_event),
+                    args=(A, param_mapping, base_P, y_true_arr, w_arr, dim0_ln_indices, alpha, l1_ratio, stop_event),
                     verbose=0,
                     method=method,
                     loss=loss_function,
@@ -3194,7 +4086,7 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
                 raise # Re-raise to be caught by caller
             
         elif backend == 'scipy_min':
-            res = fit_scipy_minimize(x_current, A, param_mapping, base_P, y_true_arr, w_arr, components, method=method, options=options, stop_event=stop_event)
+            res = fit_scipy_minimize(x_current, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, method=method, options=options, stop_event=stop_event)
             
         elif backend == 'linearized_ls':
             res = fit_linearized_ls(x_current, A, param_mapping, base_P, y_true_arr, w_arr, components, bounds, param_mapping_numba, stop_event=stop_event)
@@ -3235,6 +4127,103 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         # Handle failure gracefully?
         pass
     
+    # Post-Fit Bias Correction
+    if res and res.success and backend in ['poisson_lbfgsb', 'poisson_cupy', 'scipy_ls']:
+        try:
+            # 1. Reconstruct P
+            x_temp = res.x
+            P_temp = reconstruct_P(x_temp, param_mapping, base_P)
+            
+            # 2. Compute Pred
+            y_log = A @ P_temp
+            
+            # Apply DIM_0_LN correction (manual implementation here for consistency)
+            dim0_ln_indices = []
+            curr_P_idx = 0
+            for comp in components:
+                n = comp['n_params']
+                if comp['type'] == 'DIM_0_LN':
+                    dim0_ln_indices.append((curr_P_idx, n))
+                curr_P_idx += n
+                
+            if dim0_ln_indices:
+                for start_idx, count in dim0_ln_indices:
+                    term_linear = A[:, start_idx : start_idx + count] @ P_temp[start_idx : start_idx + count]
+                    epsilon = 1e-8
+                    term_log = np.log(np.maximum(term_linear, epsilon))
+                    y_log += (term_log - term_linear)
+            
+            y_log = np.where(y_log > 100, 100, y_log)
+            y_pred_temp = np.exp(y_log)
+            
+            # 3. Compute Bias
+            sum_w_y = np.sum(w_arr * y_true_arr)
+            sum_w_pred = np.sum(w_arr * y_pred_temp)
+            
+            if sum_w_pred > 1e-12:
+                bias_ratio = sum_w_y / sum_w_pred
+                # If bias is significant (> 0.01% ?)
+                if abs(np.log(bias_ratio)) > 1e-4:
+                    if progress_callback: progress_callback(0.91, f"Correcting global bias: {bias_ratio:.6f}")
+                    
+                    # 4. Find Intercept Parameter (name='00LVL', 'Intercept')
+                    # We need to find its index in x.
+                    # Iterate components to find compatible intercept.
+                    
+                    # Search for 'DIM_0' intercept component
+                    adjusted = False
+                    
+                    # Track P index to verify mapping
+                    curr_P_idx = 0
+                    
+                    for i, comp in enumerate(components):
+                        n = comp['n_params']
+                        # Check if intercept
+                        if comp['type'] == 'DIM_0' and (comp['name'] == '00LVL' or 'Intercept' in comp['name']):
+                            if not comp['fixed']:
+                                # Find x index for this P index (curr_P_idx)
+                                # Iterate param_mapping
+                                x_idx_accum = 0
+                                for mapping in param_mapping:
+                                    m_type = mapping[0]
+                                    m_indices = mapping[1]
+                                    
+                                    if m_type == 'direct':
+                                        # m_indices is list of P indices
+                                        if curr_P_idx in m_indices:
+                                            # Found it!
+                                            # Which index in m_indices?
+                                            sub_idx = m_indices.index(curr_P_idx)
+                                            # x index is x_idx_accum + sub_idx
+                                            target_x_idx = x_idx_accum + sub_idx
+                                            
+                                            # Update x
+                                            res.x[target_x_idx] += np.log(bias_ratio)
+                                            adjusted = True
+                                            break
+                                            
+                                        # Advance x counter
+                                        x_idx_accum += len(m_indices)
+                                        
+                                    elif m_type.startswith('mono'):
+                                        # These don't contain intercept usually
+                                        # Advance x counter
+                                        if m_type == 'mono_inc' or m_type == 'mono_dec':
+                                            x_idx_accum += mapping[2] # count
+                                        elif m_type == 'mono_2d':
+                                            rows, cols = mapping[2], mapping[3]
+                                            x_idx_accum += rows*cols
+                                    elif m_type == 'exp':
+                                        # EXP components are not typically used for global intercept adjustment
+                                        x_idx_accum += len(m_indices)
+                                            
+                                if adjusted: break
+                        
+                        curr_P_idx += n
+                        
+        except Exception as e:
+            print(f"Bias correction logic failed: {e}")
+
     P_final = reconstruct_P(res.x, param_mapping, base_P)
     
     # Generate Fit Report
@@ -3245,9 +4234,8 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
     metrics = report_metrics.copy()
     metrics['n_samples'] = len(df_data)
 
-    # Re-calculate residuals for plots and analysis (match generate_fit_report logic if needed)
-    y_log_pred = A @ P_final
-    y_pred = np.exp(y_log_pred)
+    # Re-calculate residuals for plots and analysis
+    y_pred = get_model_predictions(P_final, components, A)
     residuals = y_true_arr - y_pred # Unweighted residuals
 
     # Generate output table
@@ -3259,15 +4247,29 @@ def run_fitting_api(df_params, df_data=None, true_values=None, progress_callback
         curr_idx += n
         
         if comp['type'] == 'DIM_0':
-            rows.append({'Parameter': comp['name'], 'X1_Knot': '-', 'X2_Knot': '-', 'Fitted_Value': vals[0]})
+            name = comp['name'] + (" (Fixed)" if comp.get('fixed') else "")
+            rows.append({'Parameter': name, 'X1_Knot': '-', 'X2_Knot': '-', 'Initial_Value': comp.get('initial_value', 0.0), 'Fitted_Value': vals[0]})
+        elif comp['type'] == 'DIM_0_LN':
+            for j, sub in enumerate(comp['sub_components']):
+                name = sub['name'] + (" (Fixed)" if sub.get('fixed') else "")
+                rows.append({'Parameter': name, 'X1_Knot': '-', 'X2_Knot': '-', 'Initial_Value': sub.get('initial_value', 0.0), 'Fitted_Value': vals[j]})
         elif comp['type'] == 'DIM_1':
-            for k, v in zip(comp['knots'], vals):
-                rows.append({'Parameter': comp['name'], 'X1_Knot': k, 'X2_Knot': '-', 'Fitted_Value': v})
+            inits = comp.get('initial_values', np.zeros(n))
+            if len(inits) != n: inits = np.zeros(n)
+            fixed_arr = comp.get('fixed', np.zeros(n, dtype=bool))
+            for i_k, (k, v, init_v) in enumerate(zip(comp['knots'], vals, inits)):
+                is_fixed = fixed_arr[i_k] if i_k < len(fixed_arr) else False
+                name = comp['name'] + (" (Fixed)" if is_fixed else "")
+                rows.append({'Parameter': name, 'X1_Knot': k, 'X2_Knot': '-', 'Initial_Value': init_v, 'Fitted_Value': v})
         elif comp['type'] == 'DIM_2':
             grid = vals.reshape(comp['n_rows'], comp['n_cols'])
+            inits = comp.get('initial_values', np.zeros((comp['n_rows'], comp['n_cols'])))
+            fixed_grid = comp.get('fixed', np.zeros((comp['n_rows'], comp['n_cols']), dtype=bool))
             for r in range(comp['n_rows']):
                 for c in range(comp['n_cols']):
-                    rows.append({'Parameter': comp['name'], 'X1_Knot': comp['knots_x1'][r], 'X2_Knot': comp['knots_x2'][c], 'Fitted_Value': grid[r, c]})
+                    is_fixed = fixed_grid[r, c]
+                    name = comp['name'] + (" (Fixed)" if is_fixed else "")
+                    rows.append({'Parameter': name, 'X1_Knot': comp['knots_x1'][r], 'X2_Knot': comp['knots_x2'][c], 'Initial_Value': inits[r, c], 'Fitted_Value': grid[r, c]})
     
     df_results = pd.DataFrame(rows)
     
@@ -3502,8 +4504,7 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
     P, M = reconstruct_P_and_J_numba(x_final, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
     
     # 2. Calculate Model Predictions
-    y_log = A @ P
-    y_pred = np.exp(y_log)
+    y_pred = get_model_predictions(P, components, A)
     
     # 3. Residuals and Chi-Square
     residuals = (y_true - y_pred) / w
@@ -3559,7 +4560,6 @@ def generate_fit_report(res, x_final, A, param_mapping, base_P, y_true, w, param
         D_mat = sparse.diags(D)
         
         # H = M.T @ (A.T @ D @ A) @ M
-        # A_T_D_A = A.T @ D @ A
         # temp = A_T_D_A @ M
         # H = M.T @ temp
         
@@ -3828,12 +4828,14 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
     Generates interactive Plotly figures for fitting results.
     """
     figures = {}
+    if not HAS_PLOTLY:
+        print("Plotly not installed. Skipping interactive plots.")
+        return figures
     
     # If y_pred is not provided, compute it (fallback)
     if y_pred is None:
         A = precompute_basis(components, data)
-        y_log = A @ P
-        y_pred = np.exp(y_log)
+        y_pred = get_model_predictions(P, components, A)
         
     if residuals is None:
         residuals = y_true - y_pred
@@ -3931,9 +4933,31 @@ def plot_fitting_results_plotly(P, components, data, y_true, true_values, y_pred
             
             # --- Component Plot ---
             fig_comp = go.Figure()
-            fig_comp.add_trace(go.Scatter(x=comp['knots'], y=vals, mode='lines+markers', name='Fitted', line=dict(color='red')))
+            
+            # Robust length check
+            n_k = len(comp['knots'])
+            n_v = len(vals)
+            if n_k != n_v:
+                print(f"Warning: DIM_1 '{comp['name']}' shape mismatch. Knots: {n_k}, Params: {n_v}. Slicing to min.")
+                min_len = min(n_k, n_v)
+                x_k = comp['knots'][:min_len]
+                y_v = vals[:min_len]
+            else:
+                x_k = comp['knots']
+                y_v = vals
+                
+            fig_comp.add_trace(go.Scatter(x=x_k, y=y_v, mode='lines+markers', name='Fitted', line=dict(color='red')))
             if t_vals is not None:
-                fig_comp.add_trace(go.Scatter(x=comp['knots'], y=t_vals, mode='lines', name='True', line=dict(color='green', dash='dash')))
+                # Robustly handle t_vals vs x_k mismatch
+                min_len_t = min(len(x_k), len(t_vals))
+                if min_len_t < len(x_k) or min_len_t < len(t_vals):
+                     t_plot = t_vals[:min_len_t]
+                     x_k_t = x_k[:min_len_t]
+                else:
+                     t_plot = t_vals
+                     x_k_t = x_k
+
+                fig_comp.add_trace(go.Scatter(x=x_k_t, y=t_plot, mode='lines', name='True', line=dict(color='green', dash='dash')))
             
             fig_comp.update_layout(title=f"{comp['name']}", xaxis_title=comp['x1_var'], yaxis_title='Value',
                                    legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.5)'))
@@ -4151,8 +5175,7 @@ def fit_global_optimization(x0, A, param_mapping, base_P, y_true, w, components,
             raise InterruptedError("Fitting stopped by user.")
             
         P = reconstruct_P_numba(x, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
-        y_log = A @ P
-        y_pred = np.exp(y_log)
+        y_pred = get_model_predictions(P, components, A)
         # res = w * (y - y_pred)
         res = w * (y_true - y_pred)
         val = 0.5 * np.sum(res**2)
@@ -4228,7 +5251,11 @@ def load_model(filepath):
     return model_data
 
 # --- Cross-Validation ---
-from sklearn.model_selection import KFold
+try:
+    from sklearn.model_selection import KFold
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy_ls', method='trf', progress_callback=None):
     """
@@ -4348,8 +5375,17 @@ def run_cross_validation(k_folds, param_grid, df_params, df_data, backend='scipy
     return pd.DataFrame(results).sort_values('score')
 
 # --- MCMC (Bayesian Inference) ---
-import emcee
-import corner
+# --- Bayesian Inference (MCMC) ---
+try:
+    import emcee
+    HAS_EMCEE = True
+except ImportError:
+    HAS_EMCEE = False
+try:
+    import corner
+    HAS_CORNER = True
+except ImportError:
+    HAS_CORNER = False
 
 def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method='trf', options=None, progress_callback=None):
     """
@@ -4399,11 +5435,7 @@ def run_mcmc(n_steps, n_walkers, df_params, df_data, backend='scipy_ls', method=
         # We need to use the numba version for speed, but emcee calls this from python.
         # reconstruct_P_numba is jitted, so it's fast.
         P = reconstruct_P_numba(theta, base_P, n_map_types, n_map_starts_P, n_map_counts, n_map_cols, n_map_modes, n_direct_indices, n_direct_ptr)
-        y_log = A @ P
-        
-        # Stability clip for exp
-        y_log = np.clip(y_log, -100, 100)
-        y_pred = np.exp(y_log)
+        y_pred = get_model_predictions(P, components, A)
         
         # Gaussian likelihood
         # sigma = 1/sqrt(w) -> w = 1/sigma^2

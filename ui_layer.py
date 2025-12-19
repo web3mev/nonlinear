@@ -12,10 +12,11 @@ import time
 import streamlit.components.v1 as components
 import threading
 import stats_helper as sh
+import layout_helper as lh
 
 def render_documentation(tutorial_path="fitting_methods_tutorial.html", model_path="model_explanation.html"):
     """Renders the documentation HTML files."""
-    st.markdown("---")
+    # st.markdown("---") removed
     
     t1, t2 = st.tabs(["Fitting Methods Tutorial", "Model Explanation"])
     
@@ -56,6 +57,9 @@ def render_sidebar():
     """Renders the sidebar and returns configuration dictionary."""
     config = {}
     
+    # Apply Tight Layout Styles
+    lh.apply_tight_layout()
+    
     st.sidebar.header("Configuration")
     
     # uploaded_param_file = st.sidebar.file_uploader("Upload Parameter File", type=["csv"])
@@ -77,7 +81,7 @@ def render_sidebar():
         if 'params_df' in st.session_state:
             del st.session_state.params_df
     
-    st.sidebar.markdown("---")
+    # st.markdown("---") removed
     
     # 1. Fitting Configuration
     st.sidebar.header("Fitting Configuration")
@@ -155,8 +159,17 @@ def render_sidebar():
             st.caption("Not supported by selected backend")
         config['l1_reg'] = st.number_input("L1 Regularization", min_value=0.0, value=0.0, step=0.01, format="%.4f", disabled=reg_disabled)
         config['l2_reg'] = st.number_input("L2 Regularization", min_value=0.0, value=0.0, step=0.01, format="%.4f", disabled=reg_disabled)
+        
+        # Global Optimization Toggle for Poisson
+        if selected_backend == "poisson_lbfgsb":
+            use_global = st.checkbox("Enable Global Optimization (Basinhopping)", value=False, help="Uses Basinhopping to escape local minima.")
+            config['global_opt'] = 'basinhopping' if use_global else None
+            if use_global:
+                 st.caption("Note: Global optimization is slower but more robust.")
+        else:
+            config['global_opt'] = None
 
-    st.sidebar.markdown("---")
+    # st.markdown("---") removed
     
     # 2. Data Configuration
     st.sidebar.header("Data Configuration")
@@ -195,7 +208,7 @@ def render_sidebar():
             help="Fraction of data to load (0.0 to 1.0)"
         )
         
-    st.sidebar.markdown("---")
+    # st.markdown("---") removed
     
     # 3. Visualization & Model Management (Grouped or Separate)
     with st.sidebar.expander("Visualization & Export", expanded=False):
@@ -235,7 +248,7 @@ def render_sidebar():
                 st.error(f"Load failed: {e}")
 
     # 4. Appearance
-    st.sidebar.markdown("---")
+    # st.markdown("---") removed
     st.sidebar.markdown("### Appearance")
 
     
@@ -274,7 +287,7 @@ def render_input_section(param_file):
 
             st.session_state.params_df = edited_df
 
-            st.markdown("---")
+            # st.markdown("---") removed
             if st.button("Save Parameters to CSV"):
                 try:
                     st.session_state.params_df.to_csv(param_file, index=False)
@@ -292,7 +305,7 @@ def render_exploration():
     else:
         st.info("No data available. Upload a file or run fitting to generate.")
     if 'fitting_data' in st.session_state and st.session_state.fitting_data is not None:
-        st.markdown("---")
+        # st.markdown("---") removed
         with st.expander("Data Exploration", expanded=True):
             if 'exploration_results' not in st.session_state:
                 st.session_state.exploration_results = None
@@ -379,7 +392,7 @@ def render_exploration():
 
 def render_fitting_control(config):
     """Renders the Fitting Control section."""
-    st.markdown("---")
+    # st.markdown("---") removed
     
     # Init session vars
     for key in ['is_running', 'fitting_error', 'fitting_success', 'pruning_results']:
@@ -522,7 +535,8 @@ def render_fitting_control(config):
                             'l2_reg': config['l2_reg'],
                             'loss': config['loss_function'],
                             'n_starts': config['n_starts'],
-                            'balance_power_t': config.get('balance_power_t', 0.0)
+                            'balance_power_t': config.get('balance_power_t', 0.0),
+                            'global_opt': config.get('global_opt', None)
                         }
                         
                         def fitting_worker(stop_evt, result_container, progress_container):
@@ -593,7 +607,7 @@ def display_figure(fig):
 def render_results(key_prefix=""):
     """Renders the Results section, including Loaded Model."""
     if 'loaded_model' in st.session_state:
-        st.markdown("---")
+        # st.markdown("---") removed
         with st.expander("Loaded Model", expanded=True):
             model = st.session_state.loaded_model
             st.markdown("### Fit Report (Loaded)")
@@ -604,7 +618,7 @@ def render_results(key_prefix=""):
 
     if 'fitting_results' in st.session_state and st.session_state.fitting_results:
         results = st.session_state.fitting_results
-        st.markdown("---")
+        # st.markdown("---") removed
         with st.expander("Fitting Results", expanded=True):
             if 'report' in results:
                 st.markdown("### Fit Statistics")
@@ -630,7 +644,7 @@ def render_results(key_prefix=""):
                     elif "ℹ️" in item:
                         st.info(item.replace("ℹ️", ""), icon="ℹ️")
                     elif "---" in item:
-                         st.markdown("---") # Separators
+                         pass # st.markdown("---")
                     elif "**" in item and len(item) < 50: # Headers like "Model Specification"
                          st.markdown(f"##### {item}")
                     else:
@@ -640,7 +654,7 @@ def render_results(key_prefix=""):
                 if suggestions:
                     st.warning("**Suggestions for Improvement:**\n\n" + "\n".join([f"- {s}" for s in suggestions]))
                 
-                st.markdown("---")
+                # st.markdown("---") removed
                 
             if 'fitted_params' in results:
                 with st.expander("Fitted Parameters Table"):
@@ -1081,23 +1095,26 @@ def start_async_task(task_key, task_func, args, kwargs):
     st.session_state[f"{task_key}_result"] = None # Clear prev
     st.session_state[f"{task_key}_error"] = None
     
-    st.session_state[progress_key] = {'p': 0.0, 'text': "Starting..."}
+    progress_data = {'p': 0.0, 'text': "Starting..."}
+    st.session_state[progress_key] = progress_data
     res_container = {}
     st.session_state[f"{task_key}_container"] = res_container
     
-    def worker():
+    def worker(args_val, kwargs_val, prog_data, result_cont):
         try:
             def cb(p, text):
-                st.session_state[progress_key] = {'p': p, 'text': text}
+                prog_data['p'] = p
+                prog_data['text'] = text
             
             # Inject callback
-            kwargs['progress_callback'] = cb
-            res = task_func(*args, **kwargs)
-            res_container['result'] = res
+            kwargs_val = kwargs_val.copy() # Avoid modifying original dict if reused
+            kwargs_val['progress_callback'] = cb
+            res = task_func(*args_val, **kwargs_val)
+            result_cont['result'] = res
         except Exception as e:
-            res_container['error'] = str(e)
+            result_cont['error'] = str(e)
             
-    t = threading.Thread(target=worker)
+    t = threading.Thread(target=worker, args=(args, kwargs, progress_data, res_container))
     st.session_state[thread_key] = t
     t.start()
     st.rerun()
@@ -1336,3 +1353,253 @@ def render_nn_fitting(config):
         if st.session_state.fitting_results.get('backend', '').startswith('PyTorch'):
              st.markdown("---")
              render_results(key_prefix="nn_")
+
+# Add to ui_layer.py
+
+def run_benchmark_suite(df_params, df_data, config, progress_callback=None, stop_event=None):
+    """
+    Runs a suite of fits across different backends and methods.
+    Returns a DataFrame of results.
+    """
+    results = []
+    
+    # Define candidates
+    candidates = [
+        ("scipy_ls", "trf", "Least Squares (TRF)"),
+        ("scipy_ls", "dogbox", "Least Squares (Dogbox)"),
+        ("scipy_min", "L-BFGS-B", "Minimize (L-BFGS-B)"),
+        ("scipy_min", "SLSQP", "Minimize (SLSQP)"),
+        ("linearized_ls", "lsq_linear", "Linearized LS (Fast)"),
+        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Loss (L-BFGS-B)"),
+        ("poisson_lbfgsb", "L-BFGS-B", "Poisson Global (Basinhopping)", {"global_opt": "basinhopping", "n_iter": 5}),
+        # ("differential_evolution", "Default", "Differential Evolution", {"maxiter": 5}) # Slow, maybe optional?
+    ]
+    
+    total = len(candidates)
+    
+    for i, candidate in enumerate(candidates):
+        if stop_event and stop_event.is_set():
+            results.append({
+                "Backend": "User",
+                "Description": "Benchmark Stopped",
+                "Status": "Stopped",
+                "Time (s)": 0.0
+            })
+            break
+            
+        backend = candidate[0]
+        method = candidate[1]
+        name = candidate[2]
+        extra_opts = candidate[3] if len(candidate) > 3 else {}
+        
+        if progress_callback:
+            progress_callback(i / total, f"Running {name}...")
+            
+        # Base options
+        opts = {
+            'maxiter': config.get('max_iter', 1000), 
+            'ftol': config.get('tol_val', 1e-6),
+            'gtol': config.get('tol_val', 1e-6),
+            'l1_reg': config.get('l1_reg', 0.0),
+            'l2_reg': config.get('l2_reg', 0.0),
+            'loss': 'linear', # Default
+            'n_starts': 1, # Benchmarking usually 1 start for fairness/speed
+            'balance_power_t': config.get('balance_power_t', 1.0)
+        }
+        opts.update(extra_opts)
+        
+        start_t = time.time()
+        try:
+            res = nlf.run_fitting_api(
+                df_params=df_params,
+                df_data=df_data,
+                true_values=None, # Not strictly needed if df_data has y
+                backend=backend,
+                method=method,
+                options=opts,
+                plotting_backend='none', # No plots for benchmark
+                stop_event=stop_event
+            )
+            elapsed = time.time() - start_t
+            
+            # Extract metrics
+            r2 = res['metrics']['r2']
+            rmse = res['metrics']['rmse']
+            bias = np.mean(res['residuals'])
+            
+            # Poisson Metrics if available
+            deviance = res['metrics'].get('deviance', np.nan)
+            
+            results.append({
+                "Backend": backend,
+                "Method": method,
+                "Description": name,
+                "R2": r2,
+                "RMSE": rmse,
+                "Bias": bias,
+                "Time (s)": elapsed,
+                "Deviance": deviance,
+                "Status": "Success"
+            })
+            
+        except Exception as e:
+            elapsed = time.time() - start_t
+            status_msg = "Stopped" if stop_event and stop_event.is_set() else f"Failed: {str(e)}"
+            results.append({
+                "Backend": backend,
+                "Description": name,
+                "Status": status_msg,
+                "Time (s)": elapsed
+            })
+            
+    return pd.DataFrame(results)
+
+def render_benchmark_section(config):
+    """Renders the Benchmark Tab with Start/Stop functionality."""
+    st.header("Benchmark Suite")
+    st.markdown("Run a comparative analysis of different fitting backends on the current data.")
+    
+    # Init Session Vars
+    for key in ['is_benchmark_running', 'benchmark_error', 'benchmark_success']:
+        if key not in st.session_state:
+            st.session_state[key] = False
+            if 'error' in key: st.session_state[key] = None
+
+    if 'benchmark_results' not in st.session_state:
+        st.session_state.benchmark_results = None
+
+    # Control Buttons
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if not st.session_state.is_benchmark_running:
+            if st.button("Run Benchmark"):
+                if 'params_df' in st.session_state and 'fitting_data' in st.session_state:
+                    st.session_state.is_benchmark_running = True
+                    st.session_state.benchmark_error = None
+                    st.session_state.benchmark_results = None
+                    st.session_state.benchmark_success = False
+                    st.rerun()
+                else:
+                    st.error("Data or Parameters missing.")
+        else:
+            if st.button("Stop Benchmark"):
+                st.session_state.is_benchmark_running = False
+                if 'benchmark_stop_event' in st.session_state and st.session_state.benchmark_stop_event:
+                    st.session_state.benchmark_stop_event.set()
+                st.rerun()
+
+    # Thread Management
+    if st.session_state.is_benchmark_running:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Start Thread
+        if 'benchmark_thread' not in st.session_state or st.session_state.benchmark_thread is None:
+            if 'benchmark_thread_result' not in st.session_state: st.session_state.benchmark_thread_result = None
+            st.session_state.benchmark_progress = {'progress': 0.0, 'text': "Initializing..."}
+            
+            # Capture data to avoid st.session_state thread issues
+            df_params_captured = st.session_state.params_df
+            df_data_captured = st.session_state.fitting_data
+
+            # Helper to run in thread
+            def benchmark_worker(stop_evt, result_container, progress_container, df_p, df_d):
+                try:
+                    def b_callback(p, text):
+                        progress_container['progress'] = p
+                        progress_container['text'] = text
+                        
+                    res = run_benchmark_suite(
+                        df_p,
+                        df_d,
+                        config,
+                        progress_callback=b_callback,
+                        stop_event=stop_evt
+                    )
+                    result_container['result'] = res
+                except Exception as e:
+                    result_container['error'] = str(e)
+
+            stop_event = threading.Event()
+            result_container = {}
+            progress_container = st.session_state.benchmark_progress
+            
+            t = threading.Thread(target=benchmark_worker, args=(stop_event, result_container, progress_container, df_params_captured, df_data_captured))
+            
+            st.session_state.benchmark_stop_event = stop_event
+            st.session_state.benchmark_thread = t
+            st.session_state.benchmark_result_container = result_container
+            t.start()
+            st.rerun()
+
+        # Monitor Thread
+        if st.session_state.benchmark_thread and st.session_state.benchmark_thread.is_alive():
+            pc = st.session_state.benchmark_progress
+            progress_bar.progress(pc['progress'])
+            status_text.text(f"Benchmarking... {pc['text']}")
+            time.sleep(0.5)
+            st.rerun()
+        elif st.session_state.benchmark_thread:
+            # Thread finished
+            st.session_state.benchmark_thread.join()
+            container = st.session_state.benchmark_result_container
+            
+            if 'error' in container:
+                st.session_state.benchmark_error = container['error']
+            elif 'result' in container:
+                st.session_state.benchmark_results = container['result']
+                st.session_state.benchmark_success = True
+            
+            # Cleanup
+            st.session_state.benchmark_thread = None
+            st.session_state.benchmark_stop_event = None
+            st.session_state.is_benchmark_running = False
+            st.rerun()
+
+    # Cleanup Logic (if stopped manually)
+    if not st.session_state.is_benchmark_running and 'benchmark_thread' in st.session_state and st.session_state.benchmark_thread and st.session_state.benchmark_thread.is_alive():
+        st.warning("Stopping benchmark...")
+        if 'benchmark_stop_event' in st.session_state and st.session_state.benchmark_stop_event:
+            st.session_state.benchmark_stop_event.set()
+        st.session_state.benchmark_thread.join(timeout=5.0)
+        
+        # Save partial results if available (optional, but good UX)
+        if 'benchmark_result_container' in st.session_state and 'result' in st.session_state.benchmark_result_container:
+             st.session_state.benchmark_results = st.session_state.benchmark_result_container['result']
+        
+        st.session_state.benchmark_thread = None
+        st.session_state.benchmark_stop_event = None
+        st.rerun()
+
+    # Error Display
+    if st.session_state.benchmark_error:
+        st.error(f"Benchmark Failed: {st.session_state.benchmark_error}")
+
+    # Results Display
+    if st.session_state.benchmark_results is not None:
+        st.markdown("### Results")
+        
+        # Format table
+        df = st.session_state.benchmark_results.copy()
+        
+        # Sort by R2 descending
+        if 'R2' in df.columns:
+            df = df.sort_values('R2', ascending=False)
+            
+        st.dataframe(
+            df, 
+            column_config={
+                "R2": st.column_config.NumberColumn("R2", format="%.4f"),
+                "RMSE": st.column_config.NumberColumn("RMSE", format="%.5f"),
+                "Bias": st.column_config.NumberColumn("Bias", format="%.6f"),
+                "Time (s)": st.column_config.NumberColumn("Time (s)", format="%.3f"),
+                "Deviance": st.column_config.NumberColumn("Deviance", format="%.2f"),
+            },
+            width='stretch'
+        )
+        
+        # Highlight winner
+        if not df.empty:
+            best = df.iloc[0]
+            if best['Status'] == 'Success':
+                st.success(f"Best Performer: **{best['Description']}** (R2: {best['R2']:.4f})")
